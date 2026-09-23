@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from .ats import detect_ats
@@ -107,6 +106,15 @@ ON jobs(application_status, last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_company_title
 ON jobs(company, title);
 """
+
+
+DEFAULT_RESUMABLE_STATUSES = (
+    "not_started",
+    "review",
+    "verification_required",
+    "account_review",
+    "error",
+)
 
 
 class JobStore:
@@ -267,6 +275,38 @@ class JobStore:
             + " ORDER BY COALESCE(match_score, -1) DESC, last_seen_at DESC LIMIT ?"
         )
         params.append(int(limit))
+        return self.conn.execute(sql, params).fetchall()
+
+    def list_application_queue(
+        self,
+        minimum_score: float = 40.0,
+        statuses: Sequence[str] = DEFAULT_RESUMABLE_STATUSES,
+        limit: int = 100,
+    ):
+        clean_statuses = [str(value).strip() for value in statuses if str(value).strip()]
+        if not clean_statuses:
+            return []
+
+        placeholders = ",".join("?" for _ in clean_statuses)
+        sql = f"""
+            SELECT * FROM jobs
+            WHERE pipeline_status='resume_ready'
+              AND COALESCE(match_score, -1) >= ?
+              AND application_status IN ({placeholders})
+            ORDER BY
+              CASE application_status
+                WHEN 'not_started' THEN 0
+                WHEN 'verification_required' THEN 1
+                WHEN 'account_review' THEN 2
+                WHEN 'review' THEN 3
+                WHEN 'error' THEN 4
+                ELSE 5
+              END,
+              match_score DESC,
+              last_seen_at DESC
+            LIMIT ?
+        """
+        params = [float(minimum_score), *clean_statuses, int(limit)]
         return self.conn.execute(sql, params).fetchall()
 
     @staticmethod
