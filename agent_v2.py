@@ -99,8 +99,17 @@ def _prepare(profile, jobs, args):
     store = JobStore(args.db)
     try:
         orchestrator = PipelineOrchestrator(profile, store)
+        ingested_ids = []
         if jobs:
-            orchestrator.ingest(jobs)
+            ingested_ids = orchestrator.ingest(jobs)
+
+        # A job can be marked adapter_missing on an older run and later gain an
+        # adapter after the agent is upgraded. Recover it automatically instead
+        # of requiring the user to delete the database or edit status by hand.
+        for job_id in ingested_ids:
+            row = store.get(str(job_id))
+            if row is not None and row["application_status"] == "adapter_missing":
+                store.set_application_status(str(job_id), "not_started")
 
         ranked = orchestrator.rank_all(limit=args.scan_limit)
         prepared = orchestrator.prepare_resumes(
