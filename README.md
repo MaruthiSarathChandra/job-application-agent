@@ -15,7 +15,7 @@ V2 can:
 - reuse user-confirmed non-sensitive answers after repeated confirmation,
 - store ATS passwords in the OS keyring instead of YAML/Git/logs,
 - keep a local audit trail of application runs,
-- optionally read Gmail through OAuth for email OTP/verification links while never logging or learning the verification secret,
+- optionally read Gmail through local OAuth for email OTP/verification links while never logging or learning the verification secret,
 - stop at review by default, or submit only when `submission.mode: auto_if_safe` passes all safety gates.
 
 It does **not** bypass CAPTCHA/non-email MFA, invent experience, guess immigration/legal/compliance answers, or store plaintext passwords/OTPs.
@@ -164,6 +164,8 @@ The verifier uses Gmail readonly access. OTP/code values are kept only in memory
 
 For multiple truthful resume/email identities, use separate local profile files and run with `--profile`. This keeps emails, resumes, and verified work history isolated instead of hardcoding personal addresses into the repository.
 
+The ChatGPT Gmail connector and the local Python agent are separate authorization paths: connecting Gmail in ChatGPT does not automatically grant the local Playwright process mailbox access. The local agent uses the OAuth configuration above.
+
 ## 6. Training / learned answers
 
 When an application pauses for manual review, V2 snapshots the form before and after your edit. Eligible non-sensitive changed answers can be stored locally. Reuse requires repeated confirmation.
@@ -201,7 +203,7 @@ Application statuses include `not_started`, `in_progress`, `review`, `verificati
 
 Previously interrupted review/verification jobs can be resumed. Jobs previously marked `adapter_missing` are automatically recovered when the new code now recognizes the source.
 
-## 10. Tests
+## 10. Tests and production validation
 
 ```powershell
 python -m compileall agent browser credentials learning pipeline resume_builder pipeline_cli.py agent_v2.py main.py
@@ -209,6 +211,8 @@ python -m unittest discover -s tests -v
 ```
 
 GitHub Actions runs compile and unit-test checks on V2/main changes.
+
+CI validates syntax, deterministic state logic, parsers, routing, queue recovery, and safety rules. A live ATS still has to be validated from the local Chromium session because the CI runner does not possess your browser session, candidate identity, mailbox authorization, or the employer site's interactive state. Live failures should be treated as adapter traces to patch, not as reasons to delete local application state.
 
 ## Current ATS scope
 
