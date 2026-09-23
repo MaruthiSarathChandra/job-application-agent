@@ -7,6 +7,10 @@ __pycache__/
 # Personal candidate data
 candidate_profile.yaml
 
+# Local OAuth / secrets
+secrets/
+data/gmail_tokens/
+
 # Python
 __pycache__/
 *.py[cod]
