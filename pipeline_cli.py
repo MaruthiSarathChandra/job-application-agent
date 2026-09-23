@@ -7,8 +7,10 @@ from learning.application_memory import ApplicationMemory
 from pipeline.ats import detect_ats
 from pipeline.job_matcher import rank_jobs
 from pipeline.job_sources import (
+    expand_pdf_sources,
     extract_urls_from_pdf,
     fetch_greenhouse_jobs,
+    fetch_lever_jobs,
     leads_from_pdf,
 )
 from pipeline.job_store import JobStore
@@ -65,6 +67,33 @@ def _job_from_json(path: str) -> JobLead:
     )
 
 
+def _persist_jobs(jobs, db):
+    store = JobStore(db)
+    try:
+        ids = store.upsert_many(jobs)
+    finally:
+        store.close()
+    return ids
+
+
+def _run_pipeline(profile, jobs, db, minimum_score, limit, output_dir):
+    store = JobStore(db)
+    try:
+        orchestrator = PipelineOrchestrator(profile, store)
+        orchestrator.ingest(jobs)
+        ranked = orchestrator.rank_all(limit=max(limit * 10, 500))
+        prepared = orchestrator.prepare_resumes(
+            minimum_score=minimum_score,
+            output_dir=output_dir,
+            limit=limit,
+        )
+    finally:
+        store.close()
+
+    strong = [item for item in ranked if item.score >= minimum_score]
+    return ranked, strong, prepared
+
+
 def cmd_pdf_links(args):
     urls = extract_urls_from_pdf(args.pdf)
     for url in urls:
@@ -90,22 +119,34 @@ def cmd_greenhouse_rank(args):
 
 def cmd_ingest_greenhouse(args):
     jobs = fetch_greenhouse_jobs(args.board, company=args.company or "")
-    store = JobStore(args.db)
-    try:
-        ids = store.upsert_many(jobs)
-    finally:
-        store.close()
+    ids = _persist_jobs(jobs, args.db)
     print(f"Ingested {len(jobs)} Greenhouse job(s); {len(set(ids))} unique ID(s).")
 
 
+def cmd_ingest_lever(args):
+    jobs = fetch_lever_jobs(args.site, company=args.company or "")
+    ids = _persist_jobs(jobs, args.db)
+    print(f"Ingested {len(jobs)} Lever job(s); {len(set(ids))} unique ID(s).")
+
+
 def cmd_ingest_pdf(args):
-    jobs = leads_from_pdf(args.pdf, company=args.company or "")
-    store = JobStore(args.db)
-    try:
-        ids = store.upsert_many(jobs)
-    finally:
-        store.close()
-    print(f"Ingested {len(jobs)} PDF career/job link(s); {len(set(ids))} unique ID(s).")
+    if args.expand:
+        jobs, errors = expand_pdf_sources(
+            args.pdf,
+            company=args.company or "",
+            timeout=args.timeout,
+        )
+    else:
+        jobs = leads_from_pdf(args.pdf, company=args.company or "")
+        errors = []
+
+    ids = _persist_jobs(jobs, args.db)
+    print(f"Ingested {len(jobs)} PDF-derived job/source lead(s); {len(set(ids))} unique ID(s).")
+
+    if errors:
+        print("\nBoard expansion warnings:")
+        for item in errors:
+            print(f" - {item['source']}: {item['url']} -> {item['error']}")
 
 
 def cmd_rank_db(args):
@@ -173,23 +214,57 @@ def cmd_list_jobs(args):
 def cmd_greenhouse_pipeline(args):
     profile = CandidateProfile(args.profile)
     jobs = fetch_greenhouse_jobs(args.board, company=args.company or "")
-    store = JobStore(args.db)
-    try:
-        orchestrator = PipelineOrchestrator(profile, store)
-        orchestrator.ingest(jobs)
-        ranked = orchestrator.rank_all(limit=max(args.limit * 10, 500))
-        prepared = orchestrator.prepare_resumes(
-            minimum_score=args.minimum_score,
-            output_dir=args.output_dir,
-            limit=args.limit,
-        )
-    finally:
-        store.close()
-
-    strong = [item for item in ranked if item.score >= args.minimum_score]
+    ranked, strong, prepared = _run_pipeline(
+        profile,
+        jobs,
+        args.db,
+        args.minimum_score,
+        args.limit,
+        args.output_dir,
+    )
     print(f"Discovered: {len(jobs)}")
     print(f"Qualified:  {len(strong)}")
     print(f"Prepared:   {sum(1 for x in prepared if x.get('resume_path'))}")
+    _print_ranked(strong, min(args.limit, 20))
+
+
+def cmd_lever_pipeline(args):
+    profile = CandidateProfile(args.profile)
+    jobs = fetch_lever_jobs(args.site, company=args.company or "")
+    ranked, strong, prepared = _run_pipeline(
+        profile,
+        jobs,
+        args.db,
+        args.minimum_score,
+        args.limit,
+        args.output_dir,
+    )
+    print(f"Discovered: {len(jobs)}")
+    print(f"Qualified:  {len(strong)}")
+    print(f"Prepared:   {sum(1 for x in prepared if x.get('resume_path'))}")
+    _print_ranked(strong, min(args.limit, 20))
+
+
+def cmd_pdf_pipeline(args):
+    profile = CandidateProfile(args.profile)
+    jobs, errors = expand_pdf_sources(
+        args.pdf,
+        company=args.company or "",
+        timeout=args.timeout,
+    )
+    ranked, strong, prepared = _run_pipeline(
+        profile,
+        jobs,
+        args.db,
+        args.minimum_score,
+        args.limit,
+        args.output_dir,
+    )
+    print(f"Discovered/queued: {len(jobs)}")
+    print(f"Qualified:         {len(strong)}")
+    print(f"Prepared:          {sum(1 for x in prepared if x.get('resume_path'))}")
+    if errors:
+        print(f"Expansion warnings: {len(errors)}")
     _print_ranked(strong, min(args.limit, 20))
 
 
@@ -247,6 +322,16 @@ def cmd_recall(args):
     }, indent=2))
 
 
+def _add_pipeline_args(parser, source_arg):
+    parser.add_argument(source_arg, required=True)
+    parser.add_argument("--company", default="")
+    parser.add_argument("--profile", default="candidate_profile.yaml")
+    parser.add_argument("--db", default=DEFAULT_DB)
+    parser.add_argument("--minimum-score", type=float, default=40.0)
+    parser.add_argument("--limit", type=int, default=25)
+    parser.add_argument("--output-dir", default="data/generated_resumes")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Job Application Agent v2 pipeline")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -273,10 +358,22 @@ def build_parser():
     ingest_gh.add_argument("--db", default=DEFAULT_DB)
     ingest_gh.set_defaults(func=cmd_ingest_greenhouse)
 
+    ingest_lever = sub.add_parser("ingest-lever", help="Persist a Lever board in the job database")
+    ingest_lever.add_argument("--site", required=True)
+    ingest_lever.add_argument("--company", default="")
+    ingest_lever.add_argument("--db", default=DEFAULT_DB)
+    ingest_lever.set_defaults(func=cmd_ingest_lever)
+
     ingest_pdf = sub.add_parser("ingest-pdf", help="Persist career/job links from a PDF")
     ingest_pdf.add_argument("--pdf", required=True)
     ingest_pdf.add_argument("--company", default="")
     ingest_pdf.add_argument("--db", default=DEFAULT_DB)
+    ingest_pdf.add_argument("--timeout", type=int, default=20)
+    ingest_pdf.add_argument(
+        "--expand",
+        action="store_true",
+        help="Expand public Greenhouse/Lever board links into individual jobs",
+    )
     ingest_pdf.set_defaults(func=cmd_ingest_pdf)
 
     rank_db = sub.add_parser("rank-db", help="Rank persisted jobs against the verified candidate profile")
@@ -311,18 +408,18 @@ def build_parser():
     listing.add_argument("--limit", type=int, default=100)
     listing.set_defaults(func=cmd_list_jobs)
 
-    gp = sub.add_parser(
-        "greenhouse-pipeline",
-        help="Discover, persist, rank and prepare resumes from one Greenhouse board",
-    )
-    gp.add_argument("--board", required=True)
-    gp.add_argument("--company", default="")
-    gp.add_argument("--profile", default="candidate_profile.yaml")
-    gp.add_argument("--db", default=DEFAULT_DB)
-    gp.add_argument("--minimum-score", type=float, default=40.0)
-    gp.add_argument("--limit", type=int, default=25)
-    gp.add_argument("--output-dir", default="data/generated_resumes")
+    gp = sub.add_parser("greenhouse-pipeline", help="Discover, rank and prepare resumes from one Greenhouse board")
+    _add_pipeline_args(gp, "--board")
     gp.set_defaults(func=cmd_greenhouse_pipeline)
+
+    lp = sub.add_parser("lever-pipeline", help="Discover, rank and prepare resumes from one Lever board")
+    _add_pipeline_args(lp, "--site")
+    lp.set_defaults(func=cmd_lever_pipeline)
+
+    pp = sub.add_parser("pdf-pipeline", help="Expand a company-career PDF, rank jobs and prepare resumes")
+    _add_pipeline_args(pp, "--pdf")
+    pp.add_argument("--timeout", type=int, default=20)
+    pp.set_defaults(func=cmd_pdf_pipeline)
 
     tailor = sub.add_parser("tailor", help="Build one DOCX from verified local resume content")
     tailor.add_argument("--job", required=True, help="JSON file containing one job")
