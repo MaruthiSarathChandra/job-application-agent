@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from pipeline.job_store import JobStore, canonicalize_url, dedupe_key
-from pipeline.models import JobLead
+from pipeline.models import JobLead, JobMatch
 
 
 class JobStoreTests(unittest.TestCase):
@@ -53,6 +53,45 @@ class JobStoreTests(unittest.TestCase):
                 self.assertEqual(first_id, second_id)
                 rows = store.list_rows(limit=10)
                 self.assertEqual(len(rows), 1)
+            finally:
+                store.close()
+
+    def test_reranking_preserves_resume_ready_pipeline_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "jobs.db")
+            store = JobStore(db)
+            try:
+                job = JobLead(
+                    source="brassring",
+                    company="Acme",
+                    title="Software Engineer",
+                    url="https://sjobs.brassring.com/TGnewUI/Search/home/HomeWithPreLoad?jobId=42",
+                )
+                job_id = store.upsert(job)
+                store.set_resume(job_id, str(Path(tmp) / "resume.docx"))
+                store.set_application_status(job_id, "review")
+
+                match = JobMatch(
+                    job=job,
+                    score=50.0,
+                    title_score=30.0,
+                    skills_score=20.0,
+                    matched_skills=["Java"],
+                    reasons=["title matched"],
+                )
+                store.save_match(job_id, match)
+
+                row = store.get(job_id)
+                self.assertEqual(row["pipeline_status"], "resume_ready")
+                self.assertEqual(row["application_status"], "review")
+                self.assertTrue(row["resume_path"])
+
+                queued = store.list_application_queue(
+                    minimum_score=0,
+                    statuses=("review",),
+                    limit=10,
+                )
+                self.assertEqual([item["job_id"] for item in queued], [job_id])
             finally:
                 store.close()
 
