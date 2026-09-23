@@ -1,219 +1,115 @@
 # browser/workday_conflict_questions.py
 
-VERSION = "1.0-state-street-conflicts"
+VERSION = "2.0-scoped-state-street-conflicts"
 
 
 def normalize(value):
-
     if value is None:
         return ""
-
-    return " ".join(
-        str(value)
-        .strip()
-        .lower()
-        .split()
-    )
+    return " ".join(str(value).strip().lower().split())
 
 
 def visible(element):
-
     try:
         return element.is_visible()
-
     except Exception:
         return False
 
 
-def profile_value(
-    profile,
-    path,
-    default=None
-):
-
-    value = profile.get(
-        path
-    )
-
-    if value is None:
-        return default
-
-    return value
+def profile_value(profile, path, default=None):
+    value = profile.get(path)
+    return default if value is None else value
 
 
-# ======================================================
-# FIND QUESTION
-# ======================================================
+def close_open_prompts(page):
+    """Close any Workday prompt/menu before opening the question we want."""
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(120)
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(180)
+    except Exception:
+        pass
 
-def find_question_element(
-    page,
-    question_fragment
-):
 
-    wanted = normalize(
-        question_fragment
-    )
+def _nearest_question_context(control, question_fragment):
+    """
+    Return the nearest ancestor text that contains the question fragment.
+
+    Starting from the control instead of searching arbitrary DIV/SPAN text keeps
+    us attached to the actual question. This avoids matching Workday's language
+    menu, utility controls, or a large page ancestor containing many questions.
+    """
+    wanted = normalize(question_fragment)
+
+    try:
+        result = control.evaluate(
+            """
+            (el, wanted) => {
+                const norm = s => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+                let node = el;
+                for (let i = 0; i < 10 && node; i++, node = node.parentElement) {
+                    const text = (node.innerText || '').trim();
+                    const n = norm(text);
+                    if (n.includes(wanted)) {
+                        return { text, length: text.length, level: i };
+                    }
+                }
+                return null;
+            }
+            """,
+            wanted,
+        )
+    except Exception:
+        return None
+
+    if not result:
+        return None
+
+    # A whole-page ancestor is too broad to safely associate a control with a
+    # question. State Street question blocks are well below this threshold.
+    if int(result.get("length", 999999)) > 2200:
+        return None
+
+    return result
+
+
+def find_question_controls(page, question_fragment, selector):
+    matches = []
 
     for frame in page.frames:
-
-        selectors = [
-            "label",
-            "div",
-            "span",
-            "p",
-            "legend",
-        ]
-
-        for selector in selectors:
-
-            try:
-
-                elements = frame.locator(
-                    selector
-                )
-
-                for index in range(
-                    min(
-                        elements.count(),
-                        500
-                    )
-                ):
-
-                    element = elements.nth(
-                        index
-                    )
-
-                    if not visible(
-                        element
-                    ):
-                        continue
-
-                    try:
-
-                        text = (
-                            element
-                            .inner_text(
-                                timeout=250
-                            )
-                            .strip()
-                        )
-
-                    except Exception:
-                        continue
-
-                    if wanted in normalize(
-                        text
-                    ):
-
-                        return (
-                            frame,
-                            element
-                        )
-
-            except Exception:
-                continue
-
-    return (
-        None,
-        None
-    )
-
-
-# ======================================================
-# FIND SMALLEST QUESTION CONTAINER
-# ======================================================
-
-def find_question_container(
-    page,
-    question_fragment,
-    need_button=False,
-    need_input=False
-):
-
-    frame, question = (
-        find_question_element(
-            page,
-            question_fragment
-        )
-    )
-
-    if (
-        frame is None
-        or
-        question is None
-    ):
-
-        return (
-            None,
-            None
-        )
-
-    for level in range(
-        1,
-        10
-    ):
-
         try:
-
-            container = (
-                question.locator(
-                    f"xpath=ancestor::*[{level}]"
-                )
-                .first
-            )
-
-            if not visible(
-                container
-            ):
-                continue
-
-            if need_button:
-
-                buttons = (
-                    container.locator(
-                        'button[aria-haspopup="listbox"], '
-                        '[role="combobox"], '
-                        'button'
-                    )
-                )
-
-                if buttons.count() == 0:
-                    continue
-
-            if need_input:
-
-                inputs = (
-                    container.locator(
-                        'input:not([type="hidden"]), '
-                        "textarea"
-                    )
-                )
-
-                if inputs.count() == 0:
-                    continue
-
-            return (
-                frame,
-                container
-            )
-
+            controls = frame.locator(selector)
+            count = min(controls.count(), 100)
         except Exception:
             continue
 
-    return (
-        frame,
-        None
-    )
+        for index in range(count):
+            control = controls.nth(index)
+            if not visible(control):
+                continue
+
+            context = _nearest_question_context(control, question_fragment)
+            if context is None:
+                continue
+
+            matches.append((frame, control, context))
+
+    return matches
 
 
-# ======================================================
-# VISIBLE OPTIONS
-# ======================================================
+def find_question_control(page, question_fragment, selector, occurrence=0):
+    matches = find_question_controls(page, question_fragment, selector)
 
-def get_visible_options(page):
+    if occurrence < 0 or occurrence >= len(matches):
+        return None, None
 
+    frame, control, _ = matches[occurrence]
+    return frame, control
+
+
+def _visible_options_in(locator):
     results = []
-
     seen = set()
 
     selectors = [
@@ -222,796 +118,346 @@ def get_visible_options(page):
         '[data-automation-id="menuItem"]',
     ]
 
-    for frame in page.frames:
+    for selector in selectors:
+        try:
+            options = locator.locator(selector)
+            count = options.count()
+        except Exception:
+            continue
 
-        for selector in selectors:
+        for index in range(count):
+            option = options.nth(index)
+            if not visible(option):
+                continue
 
             try:
-
-                options = frame.locator(
-                    selector
-                )
-
-                for index in range(
-                    options.count()
-                ):
-
-                    option = options.nth(
-                        index
-                    )
-
-                    if not visible(
-                        option
-                    ):
-                        continue
-
-                    try:
-
-                        text = (
-                            option
-                            .inner_text(
-                                timeout=300
-                            )
-                            .strip()
-                        )
-
-                    except Exception:
-                        continue
-
-                    key = normalize(
-                        text
-                    )
-
-                    if not key:
-                        continue
-
-                    if key in seen:
-                        continue
-
-                    seen.add(
-                        key
-                    )
-
-                    results.append(
-                        (
-                            text,
-                            option
-                        )
-                    )
-
+                text = option.inner_text(timeout=300).strip()
             except Exception:
+                text = ""
+
+            if not text:
+                try:
+                    text = (option.get_attribute("data-automation-label") or "").strip()
+                except Exception:
+                    text = ""
+
+            key = normalize(text)
+            if not key or key in seen:
                 continue
+
+            seen.add(key)
+            results.append((text, option))
 
     return results
 
 
-# ======================================================
-# SELECT QUESTION ANSWER
-# ======================================================
-
-def select_question(
-    page,
-    question_fragment,
-    desired
-):
-
-    frame, container = (
-        find_question_container(
-            page,
-            question_fragment,
-            need_button=True
-        )
-    )
-
-    if container is None:
-
-        print(
-            "QUESTION_NOT_FOUND      ",
-            question_fragment
-        )
-
-        return False
-
-    button = None
-
-    try:
-
-        candidates = (
-            container.locator(
-                'button[aria-haspopup="listbox"], '
-                '[role="combobox"]'
-            )
-        )
-
-        for index in range(
-            candidates.count()
-        ):
-
-            candidate = (
-                candidates.nth(
-                    index
-                )
-            )
-
-            if visible(
-                candidate
-            ):
-
-                button = candidate
-                break
-
-    except Exception:
-        pass
-
-    if button is None:
-
-        # Workday fallback
+def get_open_options(page, frame, button):
+    """Get options belonging to the dropdown just opened."""
+    # Best path: Workday/ARIA points the button at its popup/listbox.
+    for attr in ("aria-controls", "aria-owns"):
         try:
+            popup_id = button.get_attribute(attr)
+        except Exception:
+            popup_id = None
 
-            candidates = (
-                container.locator(
-                    "button"
-                )
-            )
+        if not popup_id:
+            continue
 
-            for index in range(
-                candidates.count()
-            ):
-
-                candidate = (
-                    candidates.nth(
-                        index
-                    )
-                )
-
-                if not visible(
-                    candidate
-                ):
-                    continue
-
-                try:
-
-                    text = (
-                        candidate
-                        .inner_text()
-                        .strip()
-                    )
-
-                except Exception:
-                    text = ""
-
-                if (
-                    "select one"
-                    in normalize(
-                        text
-                    )
-                ):
-
-                    button = candidate
-                    break
-
+        try:
+            escaped = str(popup_id).replace('"', '\\"')
+            popup = frame.locator(f'[id="{escaped}"]')
+            if popup.count():
+                options = _visible_options_in(popup.first)
+                if options:
+                    return options
         except Exception:
             pass
 
+    # Normal Workday prompts are rendered in the same frame but may be portaled
+    # outside the local question container.
+    options = _visible_options_in(frame)
+    if options:
+        return options
+
+    # Rare iframe fallback.
+    results = []
+    seen = set()
+    for candidate_frame in page.frames:
+        for text, option in _visible_options_in(candidate_frame):
+            key = normalize(text)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append((text, option))
+    return results
+
+
+def select_question(page, question_fragment, desired, occurrence=0):
+    frame, button = find_question_control(
+        page,
+        question_fragment,
+        'button[aria-haspopup="listbox"], [role="combobox"]',
+        occurrence=occurrence,
+    )
+
     if button is None:
-
-        print(
-            "DROPDOWN_NOT_FOUND      ",
-            question_fragment
-        )
-
+        print("QUESTION_DROPDOWN_NOT_FOUND", question_fragment)
         return False
 
     try:
-
-        current = (
-            button
-            .inner_text()
-            .strip()
-        )
-
+        current = button.inner_text(timeout=500).strip()
     except Exception:
         current = ""
 
-    if (
-        normalize(current)
-        ==
-        normalize(desired)
+    desired_norm = normalize(desired)
+    current_norm = normalize(current)
+
+    if desired_norm and (
+        current_norm == desired_norm
+        or current_norm.startswith(desired_norm + " ")
+        or desired_norm in current_norm.split(" required")[0]
     ):
-
-        print(
-            f"ALREADY_SET            "
-            f"{desired}"
-        )
-
+        print(f"ALREADY_SET            {desired}")
         return True
 
+    close_open_prompts(page)
+
     try:
-
-        button.click(
-            timeout=3000
-        )
-
+        button.scroll_into_view_if_needed()
+        page.wait_for_timeout(100)
+        button.click(timeout=4000)
     except Exception as exc:
-
-        print(
-            "DROPDOWN_CLICK_FAILED:",
-            exc
-        )
-
+        print("DROPDOWN_CLICK_FAILED:", exc)
         return False
 
-    page.wait_for_timeout(
-        400
-    )
-
-    options = get_visible_options(
-        page
-    )
+    page.wait_for_timeout(350)
+    options = get_open_options(page, frame, button)
 
     for text, option in options:
+        if normalize(text) != desired_norm:
+            continue
 
-        if (
-            normalize(text)
-            ==
-            normalize(desired)
-        ):
+        try:
+            option.click(timeout=3000)
+        except Exception:
+            try:
+                option.click(timeout=3000, force=True)
+            except Exception as exc:
+                print("OPTION_CLICK_FAILED:", exc)
+                close_open_prompts(page)
+                return False
 
-            option.click(
-                timeout=3000
-            )
+        page.wait_for_timeout(250)
+        print(f"SELECTED               {desired}")
+        return True
 
-            print(
-                f"SELECTED               "
-                f"{desired}"
-            )
-
-            return True
-
-    print(
-        f"OPTION_NOT_FOUND        "
-        f"{desired}"
-    )
-
-    print(
-        "Available:",
-        [
-            text
-            for text, _
-            in options
-        ]
-    )
-
-    try:
-        page.keyboard.press(
-            "Escape"
-        )
-    except Exception:
-        pass
-
+    print(f"OPTION_NOT_FOUND        {desired}")
+    print("Available:", [text for text, _ in options])
+    close_open_prompts(page)
     return False
 
 
-# ======================================================
-# TEXT QUESTION
-# ======================================================
-
-def fill_question_text(
-    page,
-    question_fragment,
-    value
-):
-
-    frame, container = (
-        find_question_container(
-            page,
-            question_fragment,
-            need_input=True
-        )
+def fill_question_text(page, question_fragment, value, occurrence=0):
+    frame, element = find_question_control(
+        page,
+        question_fragment,
+        'textarea, input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"])',
+        occurrence=occurrence,
     )
 
-    if container is None:
-
-        print(
-            "TEXT_QUESTION_NOT_FOUND ",
-            question_fragment
-        )
-
-        return False
-
-    element = None
-
-    try:
-
-        controls = (
-            container.locator(
-                'input:not([type="hidden"]), '
-                "textarea"
-            )
-        )
-
-        for index in range(
-            controls.count()
-        ):
-
-            candidate = controls.nth(
-                index
-            )
-
-            if visible(
-                candidate
-            ):
-
-                element = candidate
-                break
-
-    except Exception:
-        pass
-
     if element is None:
-
-        print(
-            "TEXT_INPUT_NOT_FOUND    ",
-            question_fragment
-        )
-
+        print("TEXT_QUESTION_NOT_FOUND ", question_fragment, "occurrence", occurrence)
         return False
 
     try:
-
-        current = (
-            element
-            .input_value()
-            .strip()
-        )
-
+        current = element.input_value(timeout=500).strip()
     except Exception:
         current = ""
 
-    if current:
+    desired = "" if value is None else str(value).strip()
 
-        print(
-            f"ALREADY_SET            "
-            f"{current}"
-        )
+    if current == desired and desired:
+        print(f"ALREADY_SET            {desired}")
+        return True
 
+    if current and not desired:
+        print(f"ALREADY_SET            {current}")
         return True
 
     try:
-
-        element.fill(
-            str(value)
-        )
-
-        print(
-            f"FILLED                 "
-            f"{value}"
-        )
-
+        element.fill(desired)
+        print(f"FILLED                 {desired}")
         return True
-
     except Exception as exc:
-
-        print(
-            "TEXT_FILL_FAILED:",
-            exc
-        )
-
+        print("TEXT_FILL_FAILED:", exc)
         return False
 
 
-# ======================================================
-# INSPECT UNKNOWN DROPDOWN
-# ======================================================
-
-def inspect_dropdown_options(
-    page,
-    question_fragment
-):
-
-    frame, container = (
-        find_question_container(
-            page,
-            question_fragment,
-            need_button=True
-        )
+def inspect_dropdown_options(page, question_fragment, occurrence=0):
+    frame, button = find_question_control(
+        page,
+        question_fragment,
+        'button[aria-haspopup="listbox"], [role="combobox"]',
+        occurrence=occurrence,
     )
-
-    if container is None:
-
-        return []
-
-    button = None
-
-    try:
-
-        buttons = (
-            container.locator(
-                'button[aria-haspopup="listbox"], '
-                '[role="combobox"], '
-                "button"
-            )
-        )
-
-        for index in range(
-            buttons.count()
-        ):
-
-            candidate = (
-                buttons.nth(
-                    index
-                )
-            )
-
-            if not visible(
-                candidate
-            ):
-                continue
-
-            try:
-
-                text = (
-                    candidate
-                    .inner_text()
-                    .strip()
-                )
-
-            except Exception:
-                text = ""
-
-            if (
-                "select one"
-                in normalize(
-                    text
-                )
-            ):
-
-                button = candidate
-                break
-
-    except Exception:
-        pass
 
     if button is None:
+        print("QUESTION_DROPDOWN_NOT_FOUND", question_fragment)
         return []
+
+    close_open_prompts(page)
 
     try:
-
-        button.click(
-            timeout=3000
-        )
-
-        page.wait_for_timeout(
-            400
-        )
-
-    except Exception:
+        button.scroll_into_view_if_needed()
+        button.click(timeout=4000)
+        page.wait_for_timeout(350)
+    except Exception as exc:
+        print("DROPDOWN_INSPECT_FAILED:", exc)
         return []
 
-    options = [
-        text
-        for text, _
-        in get_visible_options(
-            page
-        )
-    ]
+    options = [text for text, _ in get_open_options(page, frame, button)]
 
-    print(
-        "\nOPTIONS FOR:"
-    )
-
-    print(
-        question_fragment
-    )
-
+    print("\nOPTIONS FOR:")
+    print(question_fragment)
     for option in options:
+        print(" -", option)
 
-        print(
-            " -",
-            option
-        )
-
-    try:
-
-        page.keyboard.press(
-            "Escape"
-        )
-
-    except Exception:
-        pass
-
+    close_open_prompts(page)
     return options
 
 
-# ======================================================
-# MAIN
-# ======================================================
+def fill_conflict_questions(page, profile):
+    print(f"\nworkday_conflict_questions.py VERSION {VERSION}")
 
-def fill_conflict_questions(
-    page,
-    profile
-):
+    prefix = "application_questions.conflicts_of_interest."
 
-    print(
-        f"\nworkday_conflict_questions.py "
-        f"VERSION {VERSION}"
+    public_relative = profile_value(profile, prefix + "relative_public_official")
+    senior_relative = profile_value(
+        profile,
+        prefix + "relative_senior_commercial_person",
     )
+    recruitment_option = profile_value(profile, prefix + "recruitment_option")
+    name_and_agency = profile_value(profile, prefix + "name_and_agency")
 
-    prefix = (
-        "application_questions."
-        "conflicts_of_interest."
-    )
+    # Never invent compliance/conflict facts.
+    if public_relative in {None, "REVIEW"}:
+        return {"ready": False, "reason": "relative_public_official"}
 
-    public_relative = (
-        profile_value(
-            profile,
-            prefix
-            + "relative_public_official"
-        )
-    )
+    if senior_relative in {None, "REVIEW"}:
+        return {"ready": False, "reason": "relative_senior_commercial_person"}
 
-    senior_relative = (
-        profile_value(
-            profile,
-            prefix
-            + "relative_senior_commercial_person"
-        )
-    )
-
-    recruitment_option = (
-        profile_value(
-            profile,
-            prefix
-            + "recruitment_option"
-        )
-    )
-
-    name_and_agency = (
-        profile_value(
-            profile,
-            prefix
-            + "name_and_agency"
-        )
-    )
-
-    # ==================================================
-    # DON'T GUESS COMPLIANCE ANSWERS
-    # ==================================================
-
-    if public_relative in {
-        None,
-        "REVIEW",
-    }:
-
-        print(
-            "\nREVIEW REQUIRED:"
-            "\nrelative_public_official"
-        )
-
-        return {
-            "ready":
-                False,
-
-            "reason":
-                "relative_public_official",
-        }
-
-    if senior_relative in {
-        None,
-        "REVIEW",
-    }:
-
-        print(
-            "\nREVIEW REQUIRED:"
-            "\nrelative_senior_commercial_person"
-        )
-
-        return {
-            "ready":
-                False,
-
-            "reason":
-                "relative_senior_commercial_person",
-        }
-
-    # ==================================================
-    # PUBLIC OFFICIAL
-    # ==================================================
-
-    public_answer = (
-        "Yes"
-        if bool(
-            public_relative
-        )
-        else "No"
-    )
-
+    public_answer = "Yes" if bool(public_relative) else "No"
     if not select_question(
         page,
         "Are you a relative of a current Public Official?",
-        public_answer
+        public_answer,
     ):
+        return {"ready": False, "reason": "public_official_dropdown"}
 
-        return {
-            "ready":
-                False,
-        }
-
-    public_relationship = (
-        profile_value(
-            profile,
-            prefix
-            + "public_official_relationship"
-        )
+    public_relationship = profile_value(
+        profile,
+        prefix + "public_official_relationship",
     )
-
-    public_institution = (
-        profile_value(
-            profile,
-            prefix
-            + "public_official_institution_level"
-        )
+    public_institution = profile_value(
+        profile,
+        prefix + "public_official_institution_level",
     )
 
     if not public_relative:
-
         public_relationship = "N/A"
         public_institution = "N/A"
 
     if not public_relationship:
-        return {
-            "ready":
-                False,
-
-            "reason":
-                "public_relationship_missing",
-        }
-
+        return {"ready": False, "reason": "public_relationship_missing"}
     if not public_institution:
-        return {
-            "ready":
-                False,
+        return {"ready": False, "reason": "public_institution_missing"}
 
-            "reason":
-                "public_institution_missing",
-        }
-
-    fill_question_text(
+    # The relationship and institution prompts occur twice on this page. The
+    # public-official pair is occurrence 0; the senior-commercial pair is 1.
+    if not fill_question_text(
         page,
         "If yes, what is your relationship with this individual?",
-        public_relationship
-    )
+        public_relationship,
+        occurrence=0,
+    ):
+        return {"ready": False, "reason": "public_relationship_control"}
 
-    fill_question_text(
+    if not fill_question_text(
         page,
         "If yes, please list the institution name and level of the individual.",
-        public_institution
-    )
+        public_institution,
+        occurrence=0,
+    ):
+        return {"ready": False, "reason": "public_institution_control"}
 
-    # ==================================================
-    # SENIOR COMMERCIAL PERSON
-    # ==================================================
-
-    senior_answer = (
-        "Yes"
-        if bool(
-            senior_relative
-        )
-        else "No"
-    )
-
+    senior_answer = "Yes" if bool(senior_relative) else "No"
     if not select_question(
         page,
         "Are you a relative of a current senior level person",
-        senior_answer
+        senior_answer,
     ):
+        return {"ready": False, "reason": "senior_commercial_dropdown"}
 
-        return {
-            "ready":
-                False,
-        }
-
-    senior_relationship = (
-        profile_value(
-            profile,
-            prefix
-            + "senior_commercial_relationship"
-        )
+    senior_relationship = profile_value(
+        profile,
+        prefix + "senior_commercial_relationship",
     )
-
-    senior_institution = (
-        profile_value(
-            profile,
-            prefix
-            + "senior_commercial_institution_level"
-        )
+    senior_institution = profile_value(
+        profile,
+        prefix + "senior_commercial_institution_level",
     )
 
     if not senior_relative:
-
         senior_relationship = "N/A"
         senior_institution = "N/A"
 
-    fill_question_text(
+    if not senior_relationship:
+        return {"ready": False, "reason": "senior_relationship_missing"}
+    if not senior_institution:
+        return {"ready": False, "reason": "senior_institution_missing"}
+
+    if not fill_question_text(
         page,
         "If yes, what is your relationship with this individual?",
-        senior_relationship
-    )
+        senior_relationship,
+        occurrence=1,
+    ):
+        return {"ready": False, "reason": "senior_relationship_control"}
 
-    fill_question_text(
+    if not fill_question_text(
         page,
         "If yes, please list the institution name and level of the individual.",
-        senior_institution
-    )
+        senior_institution,
+        occurrence=1,
+    ):
+        return {"ready": False, "reason": "senior_institution_control"}
 
-    # ==================================================
-    # THIRD DROPDOWN
-    # ==================================================
-
-    if recruitment_option in {
-        None,
-        "REVIEW",
-    }:
-
-        options = (
-            inspect_dropdown_options(
-                page,
-                "Please select one of the below options:"
-            )
+    if recruitment_option in {None, "REVIEW"}:
+        options = inspect_dropdown_options(
+            page,
+            "Please select one of the below options:",
         )
-
         return {
-            "ready":
-                False,
-
-            "reason":
-                "recruitment_option_review",
-
-            "available_options":
-                options,
+            "ready": False,
+            "reason": "recruitment_option_review",
+            "available_options": options,
         }
 
     if not select_question(
         page,
         "Please select one of the below options:",
-        recruitment_option
+        recruitment_option,
     ):
+        return {"ready": False, "reason": "recruitment_option"}
 
-        return {
-            "ready":
-                False,
-        }
-
-    # ==================================================
-    # NAME / AGENCY
-    # ==================================================
-
-    if name_and_agency in {
-        None,
-        "",
-        "REVIEW",
-    }:
-
-        return {
-            "ready":
-                False,
-
-            "reason":
-                "name_and_agency_review",
-        }
+    if name_and_agency in {None, "", "REVIEW"}:
+        return {"ready": False, "reason": "name_and_agency_review"}
 
     if not fill_question_text(
         page,
         "Enter your name (required) and the name of your agency",
-        name_and_agency
+        name_and_agency,
     ):
+        return {"ready": False, "reason": "name_and_agency"}
 
-        return {
-            "ready":
-                False,
-        }
-
-    return {
-        "ready":
-            True,
-    }
+    return {"ready": True}
