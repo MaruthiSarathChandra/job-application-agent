@@ -7,6 +7,7 @@ ATS_GREENHOUSE = "greenhouse"
 ATS_WORKDAY = "workday"
 ATS_LEVER = "lever"
 ATS_LINKEDIN = "linkedin"
+ATS_BRASSRING = "brassring"
 ATS_CAREER_SITE = "career_site"
 
 
@@ -28,6 +29,9 @@ def detect_ats(url: str) -> str:
     if "lever.co" in host or "jobs.lever.co" in host:
         return ATS_LEVER
 
+    if "brassring.com" in host or "sjobs.brassring.com" in host:
+        return ATS_BRASSRING
+
     if "linkedin.com" in host:
         return ATS_LINKEDIN
 
@@ -39,6 +43,9 @@ def detect_ats(url: str) -> str:
     if "/job/" in path and "workday" in value.lower():
         return ATS_WORKDAY
 
+    if "tgnewui" in path and "jobdetails" in value.lower():
+        return ATS_BRASSRING
+
     return ATS_CAREER_SITE
 
 
@@ -47,4 +54,5 @@ def is_direct_application_target(url: str) -> bool:
         ATS_GREENHOUSE,
         ATS_WORKDAY,
         ATS_LEVER,
+        ATS_BRASSRING,
     }
