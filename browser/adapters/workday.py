@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from agent.submission_policy import SubmissionPolicy
 from browser.account_manager import handle_account_page
+from browser.submission_detector import detect_submission_confirmation
 from browser.workday_conflict_questions import fill_conflict_questions
 from browser.workday_experience import fill_experience_and_education
 from browser.workday_generic_questions import fill_generic_questions
@@ -117,9 +116,6 @@ class WorkdayAdapter(ATSAdapter):
                         continue
                     if any(marker in normalized for marker in SUCCESS_ALERT_MARKERS):
                         continue
-
-                    # role=alert is also used for positive upload notifications.
-                    # Keep it only when it actually resembles an error.
                     if selector == '[role="alert"]' and not any(
                         marker in normalized for marker in NEGATIVE_ALERT_MARKERS
                     ):
@@ -149,11 +145,25 @@ class WorkdayAdapter(ATSAdapter):
         result = wait_for_step_change(page, old_step, timeout_ms=25000)
         if result.get("step") not in {old_step, "unknown"}:
             return result
+        if detect_submission_confirmation(page):
+            return {"step": "submitted", "evidence": "submission confirmation"}
         return None
 
     def run(self, page, profile, context: ApplicationContext) -> AdapterResult:
-        page.goto(self._apply_url(context.job.url), wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(1200)
+        resume_current = bool(context.metadata.get("resume_current_page"))
+
+        if not resume_current:
+            page.goto(self._apply_url(context.job.url), wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(1200)
+        else:
+            page.wait_for_timeout(350)
+
+        if detect_submission_confirmation(page):
+            return AdapterResult(
+                status="submitted",
+                submitted=True,
+                message="Workday submission confirmation detected.",
+            )
 
         route = wait_for_application_step(page, timeout_ms=6000)
         if route.get("step") == "unknown":
@@ -178,9 +188,14 @@ class WorkdayAdapter(ATSAdapter):
                     metadata={"account_state": account.state},
                 )
             if not account.ready:
-                # Some Workday tenants show an intermediate shell after account
-                # handling. Give the wizard one more chance to render.
                 page.wait_for_timeout(1200)
+
+        if detect_submission_confirmation(page):
+            return AdapterResult(
+                status="submitted",
+                submitted=True,
+                message="Workday submission confirmation detected after account handling.",
+            )
 
         route = wait_for_application_step(page, timeout_ms=15000)
         if route.get("step") == "unknown":
@@ -195,7 +210,15 @@ class WorkdayAdapter(ATSAdapter):
         memory = ApplicationMemory()
 
         try:
-            for iteration in range(1, 14):
+            for _iteration in range(1, 14):
+                if detect_submission_confirmation(page):
+                    return AdapterResult(
+                        status="submitted",
+                        submitted=True,
+                        message="Workday submission confirmation detected.",
+                        decisions=decisions,
+                    )
+
                 route = wait_for_application_step(page, timeout_ms=10000)
                 step = route.get("step", "unknown")
 
@@ -235,7 +258,7 @@ class WorkdayAdapter(ATSAdapter):
 
                     try:
                         submit.click(timeout=5000)
-                        page.wait_for_timeout(1200)
+                        page.wait_for_timeout(1600)
                     except Exception as exc:
                         return AdapterResult(
                             status="review",
@@ -245,10 +268,19 @@ class WorkdayAdapter(ATSAdapter):
                             decisions=decisions,
                         )
 
+                    if detect_submission_confirmation(page):
+                        return AdapterResult(
+                            status="submitted",
+                            submitted=True,
+                            message="Workday application submitted and confirmation detected.",
+                            decisions=decisions,
+                        )
+
                     return AdapterResult(
-                        status="submitted",
-                        submitted=True,
-                        message="Workday application submitted after the safe-submit policy passed.",
+                        status="review",
+                        review_required=True,
+                        message="Workday Submit was clicked, but no submission confirmation was detected.",
+                        blockers=[{"category": "submit_confirmation", "reason": "confirmation_not_detected"}],
                         decisions=decisions,
                     )
 
@@ -301,7 +333,7 @@ class WorkdayAdapter(ATSAdapter):
                         "confidence": 1.0,
                         "review_required": not bool(result.get("ready")),
                         "category": "conflict_of_interest",
-                        "rationale": "State Street/Workday conflict answers must come from explicit profile values.",
+                        "rationale": "Conflict answers must come from explicit profile values.",
                     })
                     if not result.get("ready"):
                         return AdapterResult(
@@ -369,7 +401,15 @@ class WorkdayAdapter(ATSAdapter):
                         decisions=decisions,
                     )
 
-                if self._advance(page, step) is None:
+                advanced = self._advance(page, step)
+                if advanced and advanced.get("step") == "submitted":
+                    return AdapterResult(
+                        status="submitted",
+                        submitted=True,
+                        message="Workday submission confirmation detected after navigation.",
+                        decisions=decisions,
+                    )
+                if advanced is None:
                     return AdapterResult(
                         status="review",
                         review_required=True,
