@@ -44,7 +44,7 @@ def _nearest_question_context(control, question_fragment):
 
     try:
         result = control.evaluate(
-            """
+            r"""
             (el, wanted) => {
                 const norm = s => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
                 let node = el;
@@ -66,8 +66,6 @@ def _nearest_question_context(control, question_fragment):
     if not result:
         return None
 
-    # A whole-page ancestor is too broad to safely associate a control with a
-    # question. State Street question blocks are well below this threshold.
     if int(result.get("length", 999999)) > 2200:
         return None
 
@@ -153,7 +151,6 @@ def _visible_options_in(locator):
 
 def get_open_options(page, frame, button):
     """Get options belonging to the dropdown just opened."""
-    # Best path: Workday/ARIA points the button at its popup/listbox.
     for attr in ("aria-controls", "aria-owns"):
         try:
             popup_id = button.get_attribute(attr)
@@ -173,13 +170,10 @@ def get_open_options(page, frame, button):
         except Exception:
             pass
 
-    # Normal Workday prompts are rendered in the same frame but may be portaled
-    # outside the local question container.
     options = _visible_options_in(frame)
     if options:
         return options
 
-    # Rare iframe fallback.
     results = []
     seen = set()
     for candidate_frame in page.frames:
@@ -339,7 +333,6 @@ def fill_conflict_questions(page, profile):
     recruitment_option = profile_value(profile, prefix + "recruitment_option")
     name_and_agency = profile_value(profile, prefix + "name_and_agency")
 
-    # Never invent compliance/conflict facts.
     if public_relative in {None, "REVIEW"}:
         return {"ready": False, "reason": "relative_public_official"}
 
@@ -372,8 +365,6 @@ def fill_conflict_questions(page, profile):
     if not public_institution:
         return {"ready": False, "reason": "public_institution_missing"}
 
-    # The relationship and institution prompts occur twice on this page. The
-    # public-official pair is occurrence 0; the senior-commercial pair is 1.
     if not fill_question_text(
         page,
         "If yes, what is your relationship with this individual?",

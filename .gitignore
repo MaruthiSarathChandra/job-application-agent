@@ -2,12 +2,6 @@
 __pycache__/
 *.pyc
 .env
-data/*.db
-data/*.sqlite
-data/*.sqlite3
-resumes/*.pdf
-# Secrets
-.env
 *.env
 
 # Personal candidate data
@@ -27,7 +21,11 @@ data/browser_profile/
 
 # Runtime/debug/application data
 data/workday_runs/
+data/generated_resumes/
+data/ranked_jobs.json
 data/*.db
+data/*.sqlite
+data/*.sqlite3
 *.db
 
 # Personal resumes
