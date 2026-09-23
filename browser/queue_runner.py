@@ -10,10 +10,12 @@ from agent.profile import CandidateProfile
 from browser.adapters import ApplicationContext, get_adapter
 from learning.application_memory import ApplicationMemory
 from learning.review_capture import ReviewCapture
+from pipeline.application_audit import ApplicationAudit
 from pipeline.job_store import JobStore
 
 
 DEFAULT_BROWSER_PROFILE = "data/browser_profile_v2"
+DEFAULT_AUDIT_DB = "data/application_audit.db"
 DEFAULT_RESUME_STATUSES = (
     "not_started",
     "review",
@@ -46,6 +48,7 @@ def _result_status(result) -> str:
 def run_queue(
     profile_path: str,
     db_path: str,
+    audit_db: str,
     browser_profile: str,
     minimum_score: float,
     limit: int,
@@ -54,6 +57,7 @@ def run_queue(
 ):
     profile = CandidateProfile(profile_path)
     store = JobStore(db_path)
+    audit = ApplicationAudit(audit_db)
     mode = _submission_mode(profile)
 
     rows = store.list_application_queue(
@@ -64,6 +68,7 @@ def run_queue(
 
     if not rows:
         print("No resume-ready jobs are currently queued for the requested statuses.")
+        audit.close()
         store.close()
         return
 
@@ -123,6 +128,24 @@ def run_queue(
                 print(job.url)
                 print("=" * 78)
 
+                run_id = audit.begin_run(
+                    job_id=job_id,
+                    ats=adapter.name,
+                    company=job.company,
+                    role=job.title,
+                    job_url=job.url,
+                    resume_path=row["resume_path"],
+                    submission_mode=mode,
+                )
+                audit.event(
+                    run_id,
+                    "start",
+                    {
+                        "match_score": row["match_score"],
+                        "previous_application_status": row["application_status"],
+                    },
+                )
+
                 store.set_application_status(job_id, "in_progress")
 
                 try:
@@ -130,6 +153,13 @@ def run_queue(
                 except Exception as exc:
                     store.set_application_status(job_id, "error")
                     store.set_error(job_id, str(exc), status="application_error")
+                    audit.finish(
+                        run_id,
+                        status="error",
+                        submitted=False,
+                        message="Adapter raised an exception.",
+                        blockers=[{"category": "exception", "reason": str(exc)}],
+                    )
                     payload = {
                         "job_id": job_id,
                         "status": "error",
@@ -142,8 +172,19 @@ def run_queue(
                 status = _result_status(result)
                 store.set_application_status(job_id, status)
 
+                audit.finish(
+                    run_id,
+                    status=status,
+                    submitted=result.submitted,
+                    message=result.message,
+                    blockers=result.blockers,
+                    decisions=result.decisions,
+                    metadata=result.metadata,
+                )
+
                 payload = {
                     "job_id": job_id,
+                    "run_id": run_id,
                     "ats": adapter.name,
                     "status": status,
                     "submitted": result.submitted,
@@ -190,6 +231,16 @@ def run_queue(
                         ats=adapter.name,
                     )
 
+                    audit.event(
+                        run_id,
+                        "manual_review_completed",
+                        {
+                            "status": status,
+                            "learned_answer_count": len(learned),
+                            "learned_questions": [item["question"] for item in learned],
+                        },
+                    )
+
                     if learned:
                         print(f"Learned {len(learned)} confirmed non-sensitive answer(s):")
                         for item in learned:
@@ -197,9 +248,6 @@ def run_queue(
                     else:
                         print("No eligible answer changes were stored from this manual step.")
 
-                    # Manual completion does not claim the job is finished. Keep
-                    # review/verification statuses resumable so the next run can
-                    # continue from the persisted browser session.
                     if status != "ready_for_review":
                         store.set_application_status(job_id, status)
                     break
@@ -207,6 +255,7 @@ def run_queue(
             context.close()
     finally:
         memory.close()
+        audit.close()
         store.close()
 
     print("\nQUEUE RESULT")
@@ -217,6 +266,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Run v2 ATS adapters over the prepared job queue")
     parser.add_argument("--profile", default="candidate_profile.yaml")
     parser.add_argument("--db", default="data/jobs.db")
+    parser.add_argument("--audit-db", default=DEFAULT_AUDIT_DB)
     parser.add_argument("--browser-profile", default=DEFAULT_BROWSER_PROFILE)
     parser.add_argument("--minimum-score", type=float, default=40.0)
     parser.add_argument("--limit", type=int, default=10)
@@ -246,6 +296,7 @@ def main():
     run_queue(
         profile_path=args.profile,
         db_path=args.db,
+        audit_db=args.audit_db,
         browser_profile=args.browser_profile,
         minimum_score=args.minimum_score,
         limit=args.limit,
