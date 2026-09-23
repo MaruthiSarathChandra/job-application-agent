@@ -1,6 +1,30 @@
 import unittest
+from unittest.mock import patch
 
-from browser.adapters.avature import classify_avature_page, normalize_avature_job_url
+from browser.adapters.avature import AvatureAdapter, classify_avature_page, normalize_avature_job_url
+
+
+class _Control:
+    def __init__(self, tag="button", control_type="submit", text="Continue", value=""):
+        self.tag = tag
+        self.control_type = control_type
+        self.text = text
+        self.value = value
+
+    def evaluate(self, script):
+        return self.tag
+
+    def get_attribute(self, name):
+        if name == "type":
+            return self.control_type
+        if name == "value":
+            return self.value
+        if name == "aria-label":
+            return None
+        return None
+
+    def inner_text(self, timeout=300):
+        return self.text
 
 
 class AvatureTests(unittest.TestCase):
@@ -29,6 +53,16 @@ class AvatureTests(unittest.TestCase):
             classify_avature_page("Software Engineer Developer Apply Now"),
             "open",
         )
+
+    def test_submit_typed_continue_on_acknowledgment_page_is_guarded(self):
+        control = _Control(control_type="submit", text="Continue")
+        with patch.object(AvatureAdapter, "_page_text", return_value="I Acknowledge *"):
+            self.assertTrue(AvatureAdapter._navigation_may_submit(object(), control))
+
+    def test_plain_next_navigation_is_not_treated_as_submit(self):
+        control = _Control(control_type="button", text="Next")
+        with patch.object(AvatureAdapter, "_page_text", return_value="Application Questions"):
+            self.assertFalse(AvatureAdapter._navigation_may_submit(object(), control))
 
 
 if __name__ == "__main__":
