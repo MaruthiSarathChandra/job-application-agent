@@ -37,6 +37,23 @@ SENSITIVE_PATTERNS = [
     r"public official",
     r"attest",
     r"certify",
+    r"acknowledge",
+    r"terms and conditions",
+    # Personal contact/address facts should come from candidate_profile.yaml,
+    # never from a prior employer form or LLM inference.
+    r"street",
+    r"address",
+    r"postal",
+    r"zip code",
+    r"zipcode",
+    r"state province",
+    r"state or province",
+    r"country phone code",
+    r"phone number",
+    r"mobile number",
+    r"telephone number",
+    r"city of residence",
+    r"country of residence",
 ]
 
 
