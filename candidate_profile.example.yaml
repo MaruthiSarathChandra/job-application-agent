@@ -49,6 +49,18 @@ work_authorization:
     value: "REVIEW"
     locked: true
 
+# Citizenship and security-clearance requirements are not inferred from work
+# authorization, nationality, visa type, or other profile fields. Keep REVIEW
+# until you personally enter the truthful value. The agent only trusts a boolean
+# when locked=true.
+eligibility:
+  us_citizen:
+    value: "REVIEW"
+    locked: true
+  has_required_security_clearance:
+    value: "REVIEW"
+    locked: true
+
 employment_history:
   previous_employers: []
 
