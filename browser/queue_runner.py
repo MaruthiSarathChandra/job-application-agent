@@ -8,6 +8,7 @@ from playwright.sync_api import sync_playwright
 
 from agent.profile import CandidateProfile
 from browser.adapters import ApplicationContext, get_adapter
+from browser.submission_detector import detect_submission_confirmation
 from learning.application_memory import ApplicationMemory
 from learning.review_capture import ReviewCapture
 from pipeline.application_audit import ApplicationAudit
@@ -22,7 +23,15 @@ DEFAULT_RESUME_STATUSES = (
     "verification_required",
     "account_review",
     "error",
+    "ready_for_review",
 )
+
+MANUAL_STATES = {
+    "review",
+    "verification_required",
+    "account_review",
+    "ready_for_review",
+}
 
 
 def _submission_mode(profile) -> str:
@@ -45,6 +54,41 @@ def _result_status(result) -> str:
     return result.status or "unknown"
 
 
+def _manual_prompt(status: str):
+    if status == "verification_required":
+        print(
+            "\nVerification is intentionally manual. Complete CAPTCHA/MFA/email "
+            "verification in the browser, then return here."
+        )
+    elif status == "account_review":
+        print(
+            "\nThe ATS account page requires your review. Complete any terms, "
+            "existing-account recovery, or other account-only step in the browser."
+        )
+    elif status == "ready_for_review":
+        print(
+            "\nThe application is ready for final review. Check the complete form. "
+            "In manual submission mode, click Submit yourself if it is correct."
+        )
+    else:
+        print(
+            "\nComplete only the review-required fields in the browser. The trainer "
+            "will learn eligible non-sensitive answers changed by you."
+        )
+
+
+def _result_payload(job_id, run_id, adapter_name, status, result):
+    return {
+        "job_id": job_id,
+        "run_id": run_id,
+        "ats": adapter_name,
+        "status": status,
+        "submitted": bool(result.submitted),
+        "message": result.message,
+        "blockers": result.blockers,
+    }
+
+
 def run_queue(
     profile_path: str,
     db_path: str,
@@ -54,6 +98,7 @@ def run_queue(
     limit: int,
     stop_on_review: bool = True,
     statuses=DEFAULT_RESUME_STATUSES,
+    max_manual_cycles: int = 4,
 ):
     profile = CandidateProfile(profile_path)
     store = JobStore(db_path)
@@ -117,6 +162,7 @@ def run_queue(
                     metadata={
                         "match_score": row["match_score"],
                         "previous_application_status": row["application_status"],
+                        "resume_current_page": False,
                     },
                 )
 
@@ -147,79 +193,51 @@ def run_queue(
                 )
 
                 store.set_application_status(job_id, "in_progress")
+                final_result = None
+                final_status = "error"
 
-                try:
-                    result = adapter.run(page, profile, application)
-                except Exception as exc:
-                    store.set_application_status(job_id, "error")
-                    store.set_error(job_id, str(exc), status="application_error")
-                    audit.finish(
+                for manual_cycle in range(max_manual_cycles + 1):
+                    try:
+                        result = adapter.run(page, profile, application)
+                    except Exception as exc:
+                        final_status = "error"
+                        store.set_error(job_id, str(exc), status="application_error")
+                        audit.event(
+                            run_id,
+                            "adapter_exception",
+                            {"cycle": manual_cycle, "error": str(exc)},
+                        )
+                        final_result = None
+                        break
+
+                    status = _result_status(result)
+                    final_result = result
+                    final_status = status
+
+                    audit.event(
                         run_id,
-                        status="error",
-                        submitted=False,
-                        message="Adapter raised an exception.",
-                        blockers=[{"category": "exception", "reason": str(exc)}],
+                        "adapter_result",
+                        {
+                            "cycle": manual_cycle,
+                            "status": status,
+                            "submitted": result.submitted,
+                            "message": result.message,
+                            "blocker_count": len(result.blockers or []),
+                        },
                     )
-                    payload = {
-                        "job_id": job_id,
-                        "status": "error",
-                        "error": str(exc),
-                    }
-                    results.append(payload)
-                    print(json.dumps(payload, indent=2))
-                    continue
 
-                status = _result_status(result)
-                store.set_application_status(job_id, status)
+                    if result.submitted or status == "submitted":
+                        final_status = "submitted"
+                        break
 
-                audit.finish(
-                    run_id,
-                    status=status,
-                    submitted=result.submitted,
-                    message=result.message,
-                    blockers=result.blockers,
-                    decisions=result.decisions,
-                    metadata=result.metadata,
-                )
+                    if status not in MANUAL_STATES:
+                        break
 
-                payload = {
-                    "job_id": job_id,
-                    "run_id": run_id,
-                    "ats": adapter.name,
-                    "status": status,
-                    "submitted": result.submitted,
-                    "message": result.message,
-                    "blockers": result.blockers,
-                }
-                results.append(payload)
-                print(json.dumps(payload, indent=2))
+                    if not stop_on_review:
+                        break
 
-                manual_states = {
-                    "review",
-                    "verification_required",
-                    "account_review",
-                    "ready_for_review",
-                }
-
-                if status in manual_states and stop_on_review:
                     before = trainer.capture(page)
-
-                    if status == "verification_required":
-                        print(
-                            "\nVerification is intentionally manual. Complete the "
-                            "CAPTCHA/MFA/email verification in the browser."
-                        )
-                    elif status == "ready_for_review":
-                        print(
-                            "\nThe application is ready for final review. In manual "
-                            "submission mode, submit it yourself if everything is correct."
-                        )
-                    else:
-                        print(
-                            "\nComplete only the review-required fields in the browser. "
-                            "The trainer will learn eligible answers changed by you."
-                        )
-
+                    _manual_prompt(status)
                     input("Press ENTER here after you are finished with this manual step...")
                     after = trainer.capture(page)
 
@@ -235,6 +253,7 @@ def run_queue(
                         run_id,
                         "manual_review_completed",
                         {
+                            "cycle": manual_cycle,
                             "status": status,
                             "learned_answer_count": len(learned),
                             "learned_questions": [item["question"] for item in learned],
@@ -248,9 +267,69 @@ def run_queue(
                     else:
                         print("No eligible answer changes were stored from this manual step.")
 
-                    if status != "ready_for_review":
-                        store.set_application_status(job_id, status)
-                    break
+                    if detect_submission_confirmation(page):
+                        result.submitted = True
+                        result.status = "submitted"
+                        result.review_required = False
+                        result.message = "Submission confirmation detected after manual review."
+                        final_result = result
+                        final_status = "submitted"
+                        break
+
+                    # Final-review pages are intentionally not looped forever in
+                    # manual mode. If the user did not submit, keep the job queued.
+                    if status == "ready_for_review":
+                        final_status = "ready_for_review"
+                        break
+
+                    if manual_cycle >= max_manual_cycles:
+                        final_status = status
+                        break
+
+                    # Continue the SAME browser page. Adapters skip navigation on
+                    # the next cycle so manually entered values and verification
+                    # state are preserved.
+                    application.metadata["resume_current_page"] = True
+                    print("\nResuming the same application automatically...")
+
+                if final_result is None:
+                    store.set_application_status(job_id, "error")
+                    audit.finish(
+                        run_id,
+                        status="error",
+                        submitted=False,
+                        message="Adapter raised an exception.",
+                        blockers=[{"category": "exception", "reason": "See adapter_exception audit event."}],
+                    )
+                    payload = {
+                        "job_id": job_id,
+                        "run_id": run_id,
+                        "ats": adapter.name,
+                        "status": "error",
+                        "submitted": False,
+                        "message": "Adapter raised an exception.",
+                    }
+                else:
+                    store.set_application_status(job_id, final_status)
+                    audit.finish(
+                        run_id,
+                        status=final_status,
+                        submitted=bool(final_result.submitted),
+                        message=final_result.message,
+                        blockers=final_result.blockers,
+                        decisions=final_result.decisions,
+                        metadata=final_result.metadata,
+                    )
+                    payload = _result_payload(
+                        job_id,
+                        run_id,
+                        adapter.name,
+                        final_status,
+                        final_result,
+                    )
+
+                results.append(payload)
+                print(json.dumps(payload, indent=2))
 
             context.close()
     finally:
@@ -270,6 +349,7 @@ def build_parser():
     parser.add_argument("--browser-profile", default=DEFAULT_BROWSER_PROFILE)
     parser.add_argument("--minimum-score", type=float, default=40.0)
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--max-manual-cycles", type=int, default=4)
     parser.add_argument(
         "--statuses",
         default=",".join(DEFAULT_RESUME_STATUSES),
@@ -281,7 +361,7 @@ def build_parser():
     parser.add_argument(
         "--continue-on-review",
         action="store_true",
-        help="Continue to later jobs instead of pausing at the first manual-review page.",
+        help="Do not pause for manual review; record the status and continue to later jobs.",
     )
     return parser
 
@@ -302,6 +382,7 @@ def main():
         limit=args.limit,
         stop_on_review=not args.continue_on_review,
         statuses=statuses,
+        max_manual_cycles=max(0, int(args.max_manual_cycles)),
     )
 
 
