@@ -16,8 +16,10 @@ venv/
 # PyCharm
 .idea/
 
-# Browser profile / cookies / sessions / cache
+# Browser profiles / cookies / sessions / cache
 data/browser_profile/
+data/browser_profile_v2/
+data/browser_profile*/
 
 # Runtime/debug/application data
 data/workday_runs/
