@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - v2/job-pipeline
+      - v2/final-hardening
       - main
   pull_request:
     branches:
@@ -29,7 +30,7 @@ jobs:
 
       - name: Compile Python
         run: |
-          python -m compileall agent browser credentials learning pipeline resume_builder pipeline_cli.py main.py
+          python -m compileall agent browser credentials learning pipeline resume_builder pipeline_cli.py agent_v2.py main.py
 
       - name: Run unit tests
         run: |

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable
 
 from agent.submission_policy import SubmissionPolicy
+from browser.submission_detector import detect_submission_confirmation
 from learning.application_memory import ApplicationMemory
 from pipeline.ats import ATS_GREENHOUSE, detect_ats
 
@@ -54,19 +55,37 @@ class GreenhouseAdapter(ATSAdapter):
             return False
 
     @staticmethod
+    def _resume_present(page, resume_path: str) -> bool:
+        name = Path(resume_path).name.lower()
+        if not name:
+            return False
+        for frame in page.frames:
+            try:
+                body = frame.locator("body")
+                if body.count() and body.first.is_visible():
+                    if name in body.first.inner_text(timeout=700).lower():
+                        return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
     def _upload_resume(page, resume_path: str) -> bool:
         path = Path(resume_path)
         if not path.exists() or not path.is_file():
             return False
 
+        if GreenhouseAdapter._resume_present(page, resume_path):
+            return True
+
         selectors = [
-            'input[type="file"][name*="resume"]',
-            'input[type="file"][id*="resume"]',
+            'input[type="file"][name*="resume" i]',
+            'input[type="file"][id*="resume" i]',
             'input[type="file"]',
         ]
         element = GreenhouseAdapter._first_visible(page, selectors)
         if element is None:
-            # File inputs can be intentionally hidden behind an Upload button.
+            # File inputs are frequently hidden behind an Upload button.
             for frame in page.frames:
                 try:
                     hidden = frame.locator('input[type="file"]')
@@ -81,7 +100,7 @@ class GreenhouseAdapter(ATSAdapter):
 
         try:
             element.set_input_files(str(path.resolve()))
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(900)
             return True
         except Exception:
             return False
@@ -111,8 +130,19 @@ class GreenhouseAdapter(ATSAdapter):
         return None
 
     def run(self, page, profile, context: ApplicationContext) -> AdapterResult:
-        page.goto(context.job.url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(900)
+        resume_current = bool(context.metadata.get("resume_current_page"))
+        if not resume_current:
+            page.goto(context.job.url, wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(900)
+        else:
+            page.wait_for_timeout(350)
+
+        if detect_submission_confirmation(page):
+            return AdapterResult(
+                status="submitted",
+                submitted=True,
+                message="Greenhouse submission confirmation detected.",
+            )
 
         first_name = profile.get("application_defaults.first_name")
         last_name = profile.get("application_defaults.last_name")
@@ -124,12 +154,12 @@ class GreenhouseAdapter(ATSAdapter):
         standard = {
             "first_name": self._fill_if_empty(
                 page,
-                ['input[name="first_name"]', 'input[id*="first_name"]', 'input[autocomplete="given-name"]'],
+                ['input[name="first_name"]', 'input[id*="first_name" i]', 'input[autocomplete="given-name"]'],
                 first_name,
             ),
             "last_name": self._fill_if_empty(
                 page,
-                ['input[name="last_name"]', 'input[id*="last_name"]', 'input[autocomplete="family-name"]'],
+                ['input[name="last_name"]', 'input[id*="last_name" i]', 'input[autocomplete="family-name"]'],
                 last_name,
             ),
             "email": self._fill_if_empty(
@@ -179,7 +209,7 @@ class GreenhouseAdapter(ATSAdapter):
 
         blockers = list(question_result.get("blockers") or [])
         submit = self._find_submit(page)
-        if submit is None:
+        if submit is None and not detect_submission_confirmation(page):
             blockers.append({
                 "category": "submit_control",
                 "reason": "Submit Application control was not found.",
@@ -211,11 +241,20 @@ class GreenhouseAdapter(ATSAdapter):
 
         try:
             submit.click(timeout=5000)
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(1400)
+            if detect_submission_confirmation(page):
+                return AdapterResult(
+                    status="submitted",
+                    submitted=True,
+                    message="Greenhouse application submitted and confirmation detected.",
+                    decisions=decisions,
+                    metadata={"standard_fields": standard, "resume_uploaded": True},
+                )
             return AdapterResult(
-                status="submitted",
-                submitted=True,
-                message="Greenhouse submit control was clicked after the safe-submit policy passed.",
+                status="review",
+                review_required=True,
+                message="Greenhouse submit was clicked, but no submission confirmation was detected.",
+                blockers=[{"category": "submit_confirmation", "reason": "confirmation_not_detected"}],
                 decisions=decisions,
                 metadata={"standard_fields": standard, "resume_uploaded": True},
             )

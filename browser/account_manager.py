@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List
 from urllib.parse import urlparse
 
 from credentials.store import get_or_create_password, get_password
+
+
+LOCALE_RE = re.compile(r"^[a-z]{2}-[A-Z]{2}$")
 
 
 @dataclass
@@ -76,8 +80,11 @@ def site_key(url: str) -> str:
     host = parsed.netloc.lower() or "unknown"
     path = [part for part in parsed.path.split("/") if part]
 
-    if "myworkdayjobs.com" in host and path:
-        return f"{host}/{path[0]}"
+    if ("myworkdayjobs.com" in host or "workdayjobs.com" in host) and path:
+        if LOCALE_RE.match(path[0]):
+            path = path[1:]
+        site = path[0] if path else "default"
+        return f"{host}/{site.lower()}"
     return host
 
 
