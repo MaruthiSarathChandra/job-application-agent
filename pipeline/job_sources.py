@@ -56,7 +56,8 @@ def extract_urls_from_pdf(pdf_path: str) -> List[str]:
 
 
 def infer_source(url: str) -> str:
-    host = urlparse(url).netloc.lower()
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
     if "greenhouse.io" in host:
         return "greenhouse"
     if "linkedin.com" in host:
@@ -65,6 +66,10 @@ def infer_source(url: str) -> str:
         return "workday"
     if "lever.co" in host:
         return "lever"
+    if "brassring.com" in host:
+        return "brassring"
+    if "avature.net" in host or host.endswith("metlifecareers.com"):
+        return "avature"
     return "career_site"
 
 
@@ -347,7 +352,6 @@ def fetch_workday_jobs(
                 description = str(info.get("jobDescription") or "")
                 external_id = str(info.get("jobReqId") or external_path)
             except Exception:
-                # Listing data is still useful even when one detail endpoint fails.
                 pass
 
         leads.append(
@@ -395,8 +399,8 @@ def expand_career_urls(
     """
     Expand public Greenhouse, Lever and Workday career boards into jobs.
 
-    Unknown/static career links remain persisted as source leads. A failed board
-    expansion never drops the original URL.
+    Other supported direct ATS links (including BrassRing and Avature) remain
+    direct source leads and are handled by their browser adapters.
     """
     jobs: List[JobLead] = []
     errors = []
@@ -446,8 +450,6 @@ def expand_career_urls(
             )
         )
 
-    # Persistent cross-source dedupe is handled by JobStore. This local pass
-    # removes duplicates produced by overlapping Workday search terms.
     seen = set()
     unique = []
     for job in jobs:
