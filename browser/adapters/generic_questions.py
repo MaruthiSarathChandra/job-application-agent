@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional
 
 from agent.engine import ApplicationEngine
@@ -33,6 +34,8 @@ PLACEHOLDER_VALUES = {
     "--",
 }
 
+PHONE_CODE_RE = re.compile(r"(?<!\d)\+\d{1,4}(?!\d)")
+
 
 def _norm(value) -> str:
     return " ".join(str(value or "").strip().lower().split())
@@ -43,6 +46,40 @@ def _visible(element) -> bool:
         return element.is_visible()
     except Exception:
         return False
+
+
+def _phone_codes(value: str):
+    return set(PHONE_CODE_RE.findall(str(value or "")))
+
+
+def _answers_equivalent(existing: str, answer: str) -> bool:
+    """Conservative semantic equality for controls that display decorated values."""
+    existing_norm = _norm(existing)
+    answer_norm = _norm(answer)
+    if not existing_norm or not answer_norm:
+        return False
+    if existing_norm == answer_norm:
+        return True
+
+    truthy = {"yes", "true", "1", "y"}
+    falsy = {"no", "false", "0", "n"}
+    if existing_norm in truthy and answer_norm in truthy:
+        return True
+    if existing_norm in falsy and answer_norm in falsy:
+        return True
+
+    existing_codes = _phone_codes(existing)
+    answer_codes = _phone_codes(answer)
+    if existing_codes and answer_codes and existing_codes.intersection(answer_codes):
+        return True
+
+    # Long text values are often decorated by the ATS (for example a country
+    # label followed by a code). Avoid substring matching for tiny answers.
+    if len(answer_norm) >= 4 and answer_norm in existing_norm:
+        return True
+    if len(existing_norm) >= 4 and existing_norm in answer_norm:
+        return True
+    return False
 
 
 def _label_for(frame, element) -> str:
@@ -111,16 +148,41 @@ def _required(element, label: str) -> bool:
 
 def _select_option(element, answer: str) -> bool:
     desired = _norm(answer)
+    desired_codes = _phone_codes(answer)
     try:
         options = element.locator("option")
+        # Exact match first.
         for index in range(options.count()):
             option = options.nth(index)
-            text = _norm(option.inner_text(timeout=300))
-            value = _norm(option.get_attribute("value"))
+            text_raw = option.inner_text(timeout=300)
+            value_raw = option.get_attribute("value") or ""
+            text = _norm(text_raw)
+            value = _norm(value_raw)
             if desired in {text, value}:
-                option_value = option.get_attribute("value")
-                element.select_option(value=option_value)
+                element.select_option(value=value_raw)
                 return True
+
+        # ATS country-code selects commonly render an answer such as +1 as
+        # "United States of America (+1)". Match the exact dial-code token,
+        # never a loose substring that could confuse +1 with +1242.
+        if desired_codes:
+            for index in range(options.count()):
+                option = options.nth(index)
+                text_raw = option.inner_text(timeout=300)
+                value_raw = option.get_attribute("value") or ""
+                if desired_codes.intersection(_phone_codes(text_raw)) or desired_codes.intersection(_phone_codes(value_raw)):
+                    element.select_option(value=value_raw)
+                    return True
+
+        # Conservative decorated-label fallback for longer answers.
+        if len(desired) >= 4:
+            for index in range(options.count()):
+                option = options.nth(index)
+                text_raw = option.inner_text(timeout=300)
+                value_raw = option.get_attribute("value") or ""
+                if _answers_equivalent(text_raw, answer) or _answers_equivalent(value_raw, answer):
+                    element.select_option(value=value_raw)
+                    return True
     except Exception:
         return False
     return False
@@ -344,7 +406,12 @@ def fill_generic_form_questions(
                 answer = str(decision.answer).strip()
                 success = False
 
-                if field_type == "radio":
+                # Do not fight an ATS control that already displays the same
+                # semantic value. This is important for decorated select labels
+                # such as "United States of America (+1)" versus profile "+1".
+                if existing and _answers_equivalent(existing, answer):
+                    success = True
+                elif field_type == "radio":
                     success = _radio_answer(frame, element, answer)
                 elif tag == "select":
                     success = _select_option(element, answer)
