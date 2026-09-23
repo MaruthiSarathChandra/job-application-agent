@@ -74,7 +74,15 @@ def question_similarity(a: str, b: str) -> float:
     b_tokens = set(b_norm.split())
     union = a_tokens | b_tokens
     jaccard = len(a_tokens & b_tokens) / len(union) if union else 0.0
-    return round((seq * 0.65) + (jaccard * 0.35), 4)
+
+    # Sequence similarity is strong for small wording changes ("this role" vs
+    # "the role"), while token overlap protects against unrelated strings that
+    # merely share a prefix. Keep the threshold high in lookup(), but do not let
+    # one harmless article/pronoun change push an otherwise near-identical
+    # question below it.
+    blended = (seq * 0.75) + (jaccard * 0.25)
+    near_edit = seq * 0.985
+    return round(max(blended, near_edit), 4)
 
 
 SCHEMA = """
