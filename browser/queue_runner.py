@@ -8,14 +8,39 @@ from playwright.sync_api import sync_playwright
 
 from agent.profile import CandidateProfile
 from browser.adapters import ApplicationContext, get_adapter
+from learning.application_memory import ApplicationMemory
+from learning.review_capture import ReviewCapture
 from pipeline.job_store import JobStore
 
 
 DEFAULT_BROWSER_PROFILE = "data/browser_profile_v2"
+DEFAULT_RESUME_STATUSES = (
+    "not_started",
+    "review",
+    "verification_required",
+    "account_review",
+    "error",
+)
 
 
 def _submission_mode(profile) -> str:
     return str(profile.get("submission.mode", "manual") or "manual").strip().lower()
+
+
+def _result_status(result) -> str:
+    if result.submitted:
+        return "submitted"
+    if result.status in {
+        "ready_for_review",
+        "verification_required",
+        "account_review",
+        "review",
+        "error",
+    }:
+        return result.status
+    if result.review_required:
+        return "review"
+    return result.status or "unknown"
 
 
 def run_queue(
@@ -25,27 +50,30 @@ def run_queue(
     minimum_score: float,
     limit: int,
     stop_on_review: bool = True,
+    statuses=DEFAULT_RESUME_STATUSES,
 ):
     profile = CandidateProfile(profile_path)
     store = JobStore(db_path)
     mode = _submission_mode(profile)
 
-    rows = store.list_rows(
+    rows = store.list_application_queue(
         minimum_score=minimum_score,
-        pipeline_status="resume_ready",
-        application_status="not_started",
+        statuses=statuses,
         limit=limit,
     )
 
     if not rows:
-        print("No resume-ready, unapplied jobs are currently queued.")
+        print("No resume-ready jobs are currently queued for the requested statuses.")
         store.close()
         return
 
     print(f"Queued jobs: {len(rows)}")
     print(f"Submission mode: {mode}")
+    print(f"Queue statuses: {', '.join(statuses)}")
 
     results = []
+    memory = ApplicationMemory()
+    trainer = ReviewCapture()
 
     try:
         with sync_playwright() as playwright:
@@ -64,12 +92,14 @@ def run_queue(
 
                 if adapter is None:
                     store.set_application_status(job_id, "adapter_missing")
-                    results.append({
+                    payload = {
                         "job_id": job_id,
                         "status": "adapter_missing",
                         "ats": row["ats"],
                         "url": job.url,
-                    })
+                    }
+                    results.append(payload)
+                    print(json.dumps(payload, indent=2))
                     continue
 
                 application = ApplicationContext(
@@ -79,11 +109,17 @@ def run_queue(
                     company=job.company,
                     role=job.title,
                     submission_mode=mode,
-                    metadata={"match_score": row["match_score"]},
+                    metadata={
+                        "match_score": row["match_score"],
+                        "previous_application_status": row["application_status"],
+                    },
                 )
 
                 print("\n" + "=" * 78)
-                print(f"JOB {job_id} | {adapter.name} | {job.company} | {job.title}")
+                print(
+                    f"JOB {job_id} | {adapter.name} | {job.company} | {job.title} "
+                    f"| previous={row['application_status']}"
+                )
                 print(job.url)
                 print("=" * 78)
 
@@ -94,25 +130,18 @@ def run_queue(
                 except Exception as exc:
                     store.set_application_status(job_id, "error")
                     store.set_error(job_id, str(exc), status="application_error")
-                    results.append({
+                    payload = {
                         "job_id": job_id,
                         "status": "error",
                         "error": str(exc),
-                    })
+                    }
+                    results.append(payload)
+                    print(json.dumps(payload, indent=2))
                     continue
 
-                if result.submitted:
-                    status = "submitted"
-                elif result.status == "ready_for_review":
-                    status = "ready_for_review"
-                elif result.status == "workday_runner_required":
-                    status = "workday_runner_required"
-                elif result.review_required:
-                    status = "review"
-                else:
-                    status = result.status or "unknown"
-
+                status = _result_status(result)
                 store.set_application_status(job_id, status)
+
                 payload = {
                     "job_id": job_id,
                     "ats": adapter.name,
@@ -124,16 +153,60 @@ def run_queue(
                 results.append(payload)
                 print(json.dumps(payload, indent=2))
 
-                if status in {"ready_for_review", "review"} and stop_on_review:
-                    print(
-                        "\nBrowser is intentionally staying open for review. "
-                        "Complete any manual fields/verification yourself."
+                manual_states = {
+                    "review",
+                    "verification_required",
+                    "account_review",
+                    "ready_for_review",
+                }
+
+                if status in manual_states and stop_on_review:
+                    before = trainer.capture(page)
+
+                    if status == "verification_required":
+                        print(
+                            "\nVerification is intentionally manual. Complete the "
+                            "CAPTCHA/MFA/email verification in the browser."
+                        )
+                    elif status == "ready_for_review":
+                        print(
+                            "\nThe application is ready for final review. In manual "
+                            "submission mode, submit it yourself if everything is correct."
+                        )
+                    else:
+                        print(
+                            "\nComplete only the review-required fields in the browser. "
+                            "The trainer will learn eligible answers changed by you."
+                        )
+
+                    input("Press ENTER here after you are finished with this manual step...")
+                    after = trainer.capture(page)
+
+                    learned = trainer.remember_changes(
+                        before,
+                        after,
+                        memory=memory,
+                        company=job.company,
+                        ats=adapter.name,
                     )
-                    input("Press ENTER here when you are finished reviewing this page...")
+
+                    if learned:
+                        print(f"Learned {len(learned)} confirmed non-sensitive answer(s):")
+                        for item in learned:
+                            print(f" - {item['question'][:100]} -> {item['answer']}")
+                    else:
+                        print("No eligible answer changes were stored from this manual step.")
+
+                    # Manual completion does not claim the job is finished. Keep
+                    # review/verification statuses resumable so the next run can
+                    # continue from the persisted browser session.
+                    if status != "ready_for_review":
+                        store.set_application_status(job_id, status)
                     break
 
             context.close()
     finally:
+        memory.close()
         store.close()
 
     print("\nQUEUE RESULT")
@@ -148,15 +221,28 @@ def build_parser():
     parser.add_argument("--minimum-score", type=float, default=40.0)
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument(
+        "--statuses",
+        default=",".join(DEFAULT_RESUME_STATUSES),
+        help=(
+            "Comma-separated application statuses to resume. Default: "
+            + ",".join(DEFAULT_RESUME_STATUSES)
+        ),
+    )
+    parser.add_argument(
         "--continue-on-review",
         action="store_true",
-        help="Continue to later jobs instead of stopping when a page requires review.",
+        help="Continue to later jobs instead of pausing at the first manual-review page.",
     )
     return parser
 
 
 def main():
     args = build_parser().parse_args()
+    statuses = tuple(
+        item.strip()
+        for item in str(args.statuses).split(",")
+        if item.strip()
+    )
     run_queue(
         profile_path=args.profile,
         db_path=args.db,
@@ -164,6 +250,7 @@ def main():
         minimum_score=args.minimum_score,
         limit=args.limit,
         stop_on_review=not args.continue_on_review,
+        statuses=statuses,
     )
 
 
