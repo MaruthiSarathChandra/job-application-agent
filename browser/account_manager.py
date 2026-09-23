@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List
 from urllib.parse import urlparse
 
+from browser.email_verification import try_complete_email_verification
 from credentials.store import get_or_create_password, get_password
 
 
@@ -59,7 +60,6 @@ def _first_visible(page, selectors):
 
 
 def _button(page, names):
-    # ATS portals frequently style navigation as either buttons or links.
     for frame in page.frames:
         for name in names:
             for role in ("button", "link"):
@@ -127,8 +127,6 @@ def detect_account_state(page) -> str:
     if password is not None and sign_in is not None:
         return "sign_in"
 
-    # A common first account step asks only for an email and then reveals either
-    # sign-in, registration, or a magic-link flow after Continue.
     email = _first_visible(
         page,
         [
@@ -275,6 +273,31 @@ def handle_account_page(
         return AccountResult(state=state, ready=True, message="Application page is already authenticated.")
 
     if state == "verification_required":
+        if email:
+            attempt = try_complete_email_verification(page, profile, email)
+            if attempt.completed:
+                try:
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                next_state = detect_account_state(page)
+                return AccountResult(
+                    state=next_state,
+                    ready=next_state == "authenticated" or next_state == "unknown",
+                    verification_required=next_state == "verification_required",
+                    message="Email verification completed without storing or logging the verification secret.",
+                    metadata={"verification_method": attempt.method},
+                )
+            if attempt.attempted:
+                return AccountResult(
+                    state=state,
+                    verification_required=True,
+                    message=(
+                        "Automatic email verification was attempted but could not safely complete. "
+                        f"Reason: {attempt.reason}"
+                    ),
+                )
+
         return AccountResult(
             state=state,
             verification_required=True,
@@ -399,9 +422,6 @@ def handle_account_page(
                 message="Account fields were found, but the create-account button was not found.",
             )
 
-        # Passwordless registration/magic-link flows are common. If password
-        # controls exist, use an OS-keyring generated credential; otherwise the
-        # email/create action itself is allowed to advance to verification.
         metadata = {}
         if passwords:
             password = get_or_create_password(key, email)
