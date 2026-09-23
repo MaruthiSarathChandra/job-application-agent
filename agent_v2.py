@@ -15,9 +15,32 @@ from pipeline.job_store import JobStore
 from pipeline.orchestrator import PipelineOrchestrator
 
 
-def _discover(args):
+def _workday_terms(profile):
+    roles = profile.get("preferences.target_roles", []) or []
+    if isinstance(roles, str):
+        roles = [roles]
+
+    terms = []
+    seen = set()
+    for role in roles:
+        value = " ".join(str(role or "").strip().split())
+        key = value.lower()
+        if not value or key in seen:
+            continue
+        seen.add(key)
+        terms.append(value)
+        if len(terms) >= 3:
+            break
+
+    if not terms:
+        terms = ["Software Engineer", "Backend Engineer", "Java"]
+    return terms
+
+
+def _discover(args, profile):
     jobs = []
     warnings = []
+    workday_terms = _workday_terms(profile)
 
     for pdf in args.pdf or []:
         try:
@@ -25,6 +48,8 @@ def _discover(args):
                 pdf,
                 company=args.company or "",
                 timeout=args.timeout,
+                workday_search_terms=workday_terms,
+                workday_max_jobs_per_term=args.workday_max_jobs,
             )
             jobs.extend(found)
             warnings.extend(errors)
@@ -55,11 +80,14 @@ def _discover(args):
         except Exception as exc:
             warnings.append({"source": "lever", "url": site, "error": str(exc)})
 
-    if args.source_url:
+    urls = list(args.workday or []) + list(args.source_url or [])
+    if urls:
         found, errors = expand_career_urls(
-            args.source_url,
+            urls,
             company=args.company or "",
             timeout=args.timeout,
+            workday_search_terms=workday_terms,
+            workday_max_jobs_per_term=args.workday_max_jobs,
         )
         jobs.extend(found)
         warnings.extend(errors)
@@ -119,16 +147,31 @@ def build_parser():
         help="Lever site token/URL. Can be supplied multiple times.",
     )
     parser.add_argument(
+        "--workday",
+        action="append",
+        default=[],
+        help=(
+            "Public Workday career-site/job URL. Board URLs are searched using "
+            "up to three target roles from the candidate profile. Can be repeated."
+        ),
+    )
+    parser.add_argument(
         "--source-url",
         action="append",
         default=[],
         help=(
-            "Direct public career/job URL. Greenhouse/Lever board URLs are expanded; "
-            "other URLs are persisted for ATS routing. Can be repeated."
+            "Direct public career/job URL. Greenhouse/Lever/Workday board URLs are "
+            "expanded where supported. Can be repeated."
         ),
     )
     parser.add_argument("--company", default="")
     parser.add_argument("--timeout", type=int, default=20)
+    parser.add_argument(
+        "--workday-max-jobs",
+        type=int,
+        default=75,
+        help="Maximum Workday jobs fetched per target-role search term.",
+    )
 
     parser.add_argument("--minimum-score", type=float, default=40.0)
     parser.add_argument("--scan-limit", type=int, default=10000)
@@ -158,7 +201,7 @@ def main():
         )
 
     profile = CandidateProfile(str(profile_path))
-    jobs, warnings = _discover(args)
+    jobs, warnings = _discover(args, profile)
     ranked, strong, prepared = _prepare(profile, jobs, args)
 
     prepared_ok = sum(1 for item in prepared if item.get("resume_path"))
