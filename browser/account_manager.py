@@ -10,6 +10,7 @@ from credentials.store import get_or_create_password, get_password
 
 
 LOCALE_RE = re.compile(r"^[a-z]{2}-[A-Z]{2}$")
+MAX_ACCOUNT_TRANSITIONS = 8
 
 
 @dataclass
@@ -60,6 +61,7 @@ def _first_visible(page, selectors):
 
 
 def _button(page, names):
+    # ATS portals frequently style navigation as either buttons or links.
     for frame in page.frames:
         for name in names:
             for role in ("button", "link"):
@@ -75,6 +77,22 @@ def _button(page, names):
                     except Exception:
                         continue
     return None
+
+
+def _password_recovery_control(page):
+    return _button(
+        page,
+        [
+            "Forgot Password",
+            "Forgot password",
+            "Forgot your password",
+            "Forgot your password?",
+            "Reset Password",
+            "Reset password",
+            "Password help",
+            "Trouble signing in",
+        ],
+    )
 
 
 def site_key(url: str) -> str:
@@ -105,6 +123,11 @@ def detect_account_state(page) -> str:
         "multifactor",
         "captcha",
         "security code",
+        "password reset link",
+        "reset link has been sent",
+        "reset link was sent",
+        "check your email",
+        "we sent you an email",
     )
     if any(marker in text for marker in verification_markers):
         return "verification_required"
@@ -121,11 +144,39 @@ def detect_account_state(page) -> str:
 
     create = _button(page, ["Create Account", "Create account", "Register", "Sign Up", "Sign up"])
     sign_in = _button(page, ["Sign In", "Sign in", "Log In", "Log in", "Login"])
+    reset = _button(
+        page,
+        [
+            "Reset Password",
+            "Reset password",
+            "Set Password",
+            "Set password",
+            "Change Password",
+            "Change password",
+            "Save Password",
+            "Save password",
+        ],
+    )
 
-    if password is not None and (confirm is not None or create is not None):
+    if password is not None and create is not None:
         return "create_account"
+    if password is not None and reset is not None:
+        return "reset_password"
+    if password is not None and confirm is not None and any(
+        marker in text
+        for marker in (
+            "reset password",
+            "new password",
+            "create a new password",
+            "set password",
+            "change password",
+        )
+    ):
+        return "reset_password"
     if password is not None and sign_in is not None:
         return "sign_in"
+    if password is not None and confirm is not None:
+        return "create_account"
 
     email = _first_visible(
         page,
@@ -146,9 +197,28 @@ def detect_account_state(page) -> str:
         "candidate account",
         "existing account",
         "new account",
+        "forgot password",
+        "reset password",
     )
     if email is not None and any(marker in text for marker in account_words):
-        if _button(page, ["Continue", "Next", "Sign In", "Sign in", "Create Account", "Create account", "Register"]):
+        if _button(
+            page,
+            [
+                "Continue",
+                "Next",
+                "Sign In",
+                "Sign in",
+                "Create Account",
+                "Create account",
+                "Register",
+                "Send Reset Link",
+                "Send reset link",
+                "Send Code",
+                "Send code",
+                "Reset Password",
+                "Reset password",
+            ],
+        ):
             return "email_entry"
 
     if any(
@@ -259,11 +329,37 @@ def _required_unhandled_checkboxes(page):
     return blockers
 
 
+def _reenter(
+    page,
+    profile,
+    allow_create: bool,
+    allow_sign_in: bool,
+    depth: int,
+) -> AccountResult:
+    if depth >= MAX_ACCOUNT_TRANSITIONS:
+        return AccountResult(
+            state=detect_account_state(page),
+            blockers=[{
+                "category": "account_flow",
+                "reason": "Account flow exceeded the automatic transition limit.",
+            }],
+            message="Account flow did not settle after several automatic transitions.",
+        )
+    return handle_account_page(
+        page,
+        profile,
+        allow_create=allow_create,
+        allow_sign_in=allow_sign_in,
+        _depth=depth + 1,
+    )
+
+
 def handle_account_page(
     page,
     profile,
     allow_create: bool = True,
     allow_sign_in: bool = True,
+    _depth: int = 0,
 ) -> AccountResult:
     state = detect_account_state(page)
     email = str(profile.get("candidate.email", "") or "").strip()
@@ -277,17 +373,10 @@ def handle_account_page(
             attempt = try_complete_email_verification(page, profile, email)
             if attempt.completed:
                 try:
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(700)
                 except Exception:
                     pass
-                next_state = detect_account_state(page)
-                return AccountResult(
-                    state=next_state,
-                    ready=next_state == "authenticated" or next_state == "unknown",
-                    verification_required=next_state == "verification_required",
-                    message="Email verification completed without storing or logging the verification secret.",
-                    metadata={"verification_method": attempt.method},
-                )
+                return _reenter(page, profile, allow_create, allow_sign_in, _depth)
             if attempt.attempted:
                 return AccountResult(
                     state=state,
@@ -327,22 +416,22 @@ def handle_account_page(
                 "Create Account",
                 "Create account",
                 "Register",
+                "Send Reset Link",
+                "Send reset link",
+                "Send Code",
+                "Send code",
+                "Reset Password",
+                "Reset password",
             ],
         )
         if button is None:
             return AccountResult(state=state, message="Account email was filled but no safe continue control was found.")
         try:
             button.click(timeout=5000)
-            page.wait_for_timeout(900)
+            page.wait_for_timeout(1000)
         except Exception as exc:
             return AccountResult(state=state, message=f"Account email-step click failed: {exc}")
-        next_state = detect_account_state(page)
-        return AccountResult(
-            state=next_state,
-            ready=next_state == "authenticated",
-            verification_required=next_state == "verification_required",
-            message="Account email step completed.",
-        )
+        return _reenter(page, profile, allow_create, allow_sign_in, _depth)
 
     if state == "sign_in":
         if not allow_sign_in:
@@ -350,13 +439,29 @@ def handle_account_page(
 
         password = get_password(key, email)
         if not password:
+            recovery = _password_recovery_control(page)
+            if recovery is not None:
+                try:
+                    _fill_email(page, email)
+                    recovery.click(timeout=5000)
+                    page.wait_for_timeout(1000)
+                except Exception as exc:
+                    return AccountResult(
+                        state=state,
+                        blockers=[{"category": "credential_recovery", "reason": str(exc)}],
+                        message="Password recovery control was found but could not be opened.",
+                    )
+                result = _reenter(page, profile, allow_create, allow_sign_in, _depth)
+                result.metadata.setdefault("credential_recovery", "password_reset")
+                return result
+
             return AccountResult(
                 state=state,
                 blockers=[{
                     "category": "credential",
-                    "reason": "No password is stored in the OS keyring for this ATS tenant.",
+                    "reason": "No password is stored in the OS keyring and no safe password-recovery control was found.",
                 }],
-                message="Existing account detected but no stored credential is available.",
+                message="Existing account detected but no stored credential or automatic recovery path is available.",
             )
 
         email_ok = _fill_email(page, email)
@@ -375,17 +480,81 @@ def handle_account_page(
 
         try:
             button.click(timeout=5000)
-            page.wait_for_timeout(900)
+            page.wait_for_timeout(1000)
         except Exception as exc:
             return AccountResult(state=state, message=f"Sign-in click failed: {exc}")
 
         next_state = detect_account_state(page)
-        return AccountResult(
-            state=next_state,
-            ready=next_state == "authenticated",
-            verification_required=next_state == "verification_required",
-            message="Sign-in submitted using the OS-keyring credential.",
+        if next_state == "sign_in":
+            return AccountResult(
+                state=next_state,
+                blockers=[{
+                    "category": "credential",
+                    "reason": "Stored credential was rejected or the sign-in page did not advance.",
+                }],
+                message="Stored ATS credential did not advance sign-in; review or reset the account credential.",
+            )
+        return _reenter(page, profile, allow_create, allow_sign_in, _depth)
+
+    if state == "reset_password":
+        passwords = _password_fields(page)
+        if not passwords:
+            return AccountResult(
+                state=state,
+                blockers=[{"category": "credential_recovery", "reason": "Password reset fields were not found."}],
+                message="Password reset page was detected but password fields were unavailable.",
+            )
+
+        password = get_or_create_password(key, email)
+        try:
+            passwords[0].fill(password)
+            if len(passwords) > 1:
+                passwords[1].fill(password)
+        except Exception:
+            return AccountResult(
+                state=state,
+                blockers=[{"category": "credential_recovery", "reason": "Could not fill generated reset password."}],
+                message="Could not safely fill the password-reset fields.",
+            )
+
+        button = _button(
+            page,
+            [
+                "Reset Password",
+                "Reset password",
+                "Set Password",
+                "Set password",
+                "Change Password",
+                "Change password",
+                "Save Password",
+                "Save password",
+                "Continue",
+                "Submit",
+            ],
         )
+        if button is None:
+            return AccountResult(
+                state=state,
+                blockers=[{"category": "credential_recovery", "reason": "Password reset submit control was not found."}],
+                message="Generated password is stored in the OS keyring, but the reset submit control was not found.",
+                metadata={"credential_source": "os_keyring"},
+            )
+
+        try:
+            button.click(timeout=5000)
+            page.wait_for_timeout(1100)
+        except Exception as exc:
+            return AccountResult(
+                state=state,
+                blockers=[{"category": "credential_recovery", "reason": str(exc)}],
+                message="Password-reset submission failed.",
+                metadata={"credential_source": "os_keyring"},
+            )
+
+        result = _reenter(page, profile, allow_create, allow_sign_in, _depth)
+        result.metadata.setdefault("credential_source", "os_keyring")
+        result.metadata.setdefault("credential_recovery", "password_reset")
+        return result
 
     if state == "create_account":
         if not allow_create:
@@ -435,7 +604,7 @@ def handle_account_page(
 
         try:
             button.click(timeout=5000)
-            page.wait_for_timeout(900)
+            page.wait_for_timeout(1000)
         except Exception as exc:
             return AccountResult(
                 state=state,
@@ -443,17 +612,10 @@ def handle_account_page(
                 metadata=metadata,
             )
 
-        next_state = detect_account_state(page)
-        return AccountResult(
-            state=next_state,
-            ready=next_state == "authenticated",
-            verification_required=next_state == "verification_required",
-            message=(
-                "Account creation submitted. Any generated password is stored only "
-                "in the OS keyring and is not logged."
-            ),
-            metadata=metadata,
-        )
+        result = _reenter(page, profile, allow_create, allow_sign_in, _depth)
+        for key_name, value in metadata.items():
+            result.metadata.setdefault(key_name, value)
+        return result
 
     return AccountResult(
         state="unknown",
