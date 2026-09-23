@@ -198,11 +198,22 @@ class JobStore:
         return [self.upsert(job) for job in jobs]
 
     def save_match(self, job_id: str, match: JobMatch):
+        """
+        Save the latest score without destroying downstream pipeline progress.
+
+        Re-running discovery/ranking is common. If a resume was already generated,
+        the job must remain `resume_ready`; otherwise the application queue loses
+        the job even though `resume_path` still points at a valid DOCX.
+        """
         self.conn.execute(
             """
             UPDATE jobs
             SET match_score=?, title_score=?, skills_score=?, matched_skills=?,
-                reasons=?, pipeline_status=?
+                reasons=?,
+                pipeline_status=CASE
+                    WHEN TRIM(COALESCE(resume_path, '')) <> '' THEN 'resume_ready'
+                    ELSE ?
+                END
             WHERE job_id=?
             """,
             (
