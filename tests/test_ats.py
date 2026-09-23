@@ -1,6 +1,7 @@
 import unittest
 
 from pipeline.ats import (
+    ATS_BRASSRING,
     ATS_CAREER_SITE,
     ATS_GREENHOUSE,
     ATS_LEVER,
@@ -27,6 +28,15 @@ class AtsDetectionTests(unittest.TestCase):
         self.assertEqual(
             detect_ats("https://jobs.lever.co/example/abc"),
             ATS_LEVER,
+        )
+
+    def test_brassring(self):
+        self.assertEqual(
+            detect_ats(
+                "https://sjobs.brassring.com/TGnewUI/Search/home/HomeWithPreLoad?"
+                "PageType=JobDetails&partnerid=25539&siteid=5313&jobId=5235658"
+            ),
+            ATS_BRASSRING,
         )
 
     def test_linkedin(self):
