@@ -9,6 +9,7 @@ REVIEW_CATEGORIES = {
     "security_clearance",
     "government_eligibility",
     "salary_commitment",
+    "conflict_of_interest",
     "disability",
     "veteran_status",
     "race_ethnicity",
