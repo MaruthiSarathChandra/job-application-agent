@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from email.utils import parseaddr
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List
 from urllib.parse import urlparse
 
 
@@ -26,6 +26,8 @@ VERIFICATION_WORDS = (
     "security code",
     "confirmation",
     "confirm your email",
+    "reset password",
+    "password reset",
 )
 
 
@@ -222,9 +224,8 @@ def _candidate_messages(service, current_url: str, timeout_seconds: int):
             if not any(word in normalized for word in VERIFICATION_WORDS):
                 continue
             if host_tokens and not any(token in normalized for token in host_tokens):
-                # Many ATS emails come from a vendor domain, so this is a score
-                # preference rather than a hard rejection. Yield after messages
-                # that explicitly mention the current site/brand.
+                # ATS email can be sent by a vendor domain, so host matching is
+                # a preference rather than a hard rejection.
                 pass
             yield combined
         time.sleep(3)
@@ -316,9 +317,11 @@ def try_complete_email_verification(page, profile, email: str) -> VerificationAt
             if not trusted_verification_link(link, page.url, trusted_domains):
                 continue
             try:
-                verifier_page = page.context.new_page()
-                verifier_page.goto(link, wait_until="domcontentloaded", timeout=30000)
-                verifier_page.wait_for_timeout(1200)
+                # Keep verification in the active application page so the account
+                # state machine continues from the verified/reset-password page
+                # instead of being stranded on the old tab.
+                page.goto(link, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1200)
                 return VerificationAttempt(attempted=True, completed=True, method="gmail_link")
             except Exception:
                 continue
