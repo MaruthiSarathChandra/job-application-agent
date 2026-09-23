@@ -64,38 +64,111 @@ def _set_default_font(document: Document):
     styles["Normal"].font.size = Pt(9.5)
 
 
-def build_tailored_resume(profile, job, output_path: str) -> str:
+def _legacy_location(value):
+    if isinstance(value, dict):
+        return ", ".join(
+            str(value.get(key, "")).strip()
+            for key in ("city", "state", "country")
+            if str(value.get(key, "")).strip()
+        )
+    return str(value or "").strip()
+
+
+def _legacy_dates(item):
+    start_month = str(item.get("start_month", "") or "").strip()
+    start_year = str(item.get("start_year", "") or "").strip()
+    start = " ".join(part for part in (start_month, start_year) if part)
+
+    if item.get("current_job"):
+        end = "Present"
+    else:
+        end_month = str(item.get("end_month", "") or "").strip()
+        end_year = str(item.get("end_year", "") or "").strip()
+        end = " ".join(part for part in (end_month, end_year) if part)
+
+    return " - ".join(part for part in (start, end) if part)
+
+
+def _resume_content(profile):
     """
-    Build a DOCX only from explicitly verified resume_content in the local
-    candidate profile. No employment, dates, metrics, skills or bullets are
-    invented by this function.
+    Return verified resume content, accepting both the V2 resume_content shape and
+    the legacy profile shape already used by the Workday automation.
 
-    Expected local profile shape:
-
-    resume_content:
-      headline: "Software Engineer"
-      summary: "..."
-      experience:
-        - employer: "..."
-          title: "..."
-          location: "..."
-          dates: "..."
-          bullets:
-            - text: "..."
-              tags: [java, spring boot]
-      projects:
-        - name: "..."
-          tech: "..."
-          bullets: [...]
+    This adapter does not invent facts. It only converts fields that already
+    exist in candidate_profile.yaml.
     """
     content = profile.get("resume_content", {}) or {}
+    experience = list(content.get("experience", []) or [])
+    projects = list(content.get("projects", []) or [])
+
+    if not experience:
+        for item in profile.get("work_experience", []) or []:
+            if not isinstance(item, dict):
+                continue
+            description = str(item.get("description", "") or "").strip()
+            bullets = item.get("bullets", []) or []
+            if not bullets and description:
+                bullets = [description]
+            experience.append(
+                {
+                    "employer": str(item.get("employer", "") or "").strip(),
+                    "title": str(
+                        item.get("job_title", "")
+                        or item.get("title", "")
+                        or ""
+                    ).strip(),
+                    "location": _legacy_location(item.get("location")),
+                    "dates": _legacy_dates(item),
+                    "bullets": bullets,
+                }
+            )
+
+    if not projects:
+        legacy_projects = profile.get("verified_facts.projects", []) or []
+        for item in legacy_projects:
+            if isinstance(item, dict):
+                name = str(item.get("name", "") or item.get("title", "") or "").strip()
+                tech = item.get("tech", "") or item.get("technologies", "") or ""
+                if isinstance(tech, list):
+                    tech = ", ".join(str(x) for x in tech)
+                bullets = item.get("bullets", []) or []
+                description = str(item.get("description", "") or "").strip()
+                if not bullets and description:
+                    bullets = [description]
+                projects.append(
+                    {
+                        "name": name,
+                        "tech": str(tech).strip(),
+                        "bullets": bullets,
+                    }
+                )
+            elif isinstance(item, str) and item.strip():
+                projects.append({"name": item.strip(), "tech": "", "bullets": []})
+
+    return {
+        "headline": str(content.get("headline", "") or "").strip(),
+        "summary": str(content.get("summary", "") or "").strip(),
+        "experience": experience,
+        "projects": projects,
+    }
+
+
+def build_tailored_resume(profile, job, output_path: str) -> str:
+    """
+    Build a DOCX only from explicitly verified local profile content.
+
+    V2 prefers resume_content, but legacy work_experience and
+    verified_facts.projects are also accepted so existing profiles do not need a
+    manual migration before the first V2 run.
+    """
+    content = _resume_content(profile)
     experience = content.get("experience", []) or []
     projects = content.get("projects", []) or []
 
     if not experience and not projects:
         raise ValueError(
-            "candidate_profile.yaml needs verified resume_content.experience "
-            "or resume_content.projects before automatic resume generation."
+            "candidate_profile.yaml needs verified resume_content, work_experience, "
+            "or verified_facts.projects before automatic resume generation."
         )
 
     candidate = profile.get("candidate", {}) or {}
@@ -135,6 +208,8 @@ def build_tailored_resume(profile, job, output_path: str) -> str:
         document.add_paragraph(" | ".join(contact_parts))
 
     headline = str(content.get("headline", "")).strip()
+    if not headline and experience:
+        headline = str(experience[0].get("title", "") or "").strip()
     if headline:
         p = document.add_paragraph()
         r = p.add_run(headline)
@@ -182,14 +257,14 @@ def build_tailored_resume(profile, job, output_path: str) -> str:
             )
             score = len(_tokens(combined).intersection(job_tokens))
             ranked_projects.append((score, -index, project))
-        ranked_projects.sort(reverse=True)
+        ranked_projects.sort(key=lambda item: (item[0], item[1]), reverse=True)
 
         for _, _, project in ranked_projects[:4]:
-            name = str(project.get("name", "")).strip()
+            project_name = str(project.get("name", "")).strip()
             tech = str(project.get("tech", "")).strip()
-            if name:
+            if project_name:
                 p = document.add_paragraph()
-                r = p.add_run(name)
+                r = p.add_run(project_name)
                 r.bold = True
                 if tech:
                     p.add_run(f" | {tech}")
