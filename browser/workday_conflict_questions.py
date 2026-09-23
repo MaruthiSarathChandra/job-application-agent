@@ -1,6 +1,6 @@
 # browser/workday_conflict_questions.py
 
-VERSION = "2.0-scoped-state-street-conflicts"
+VERSION = "2.1-user-review-resume"
 
 
 def normalize(value):
@@ -186,6 +186,61 @@ def get_open_options(page, frame, button):
     return results
 
 
+def _dropdown_current(page, question_fragment, occurrence=0):
+    _frame, button = find_question_control(
+        page,
+        question_fragment,
+        'button[aria-haspopup="listbox"], [role="combobox"]',
+        occurrence=occurrence,
+    )
+    if button is None:
+        return ""
+    try:
+        text = button.inner_text(timeout=500).strip()
+    except Exception:
+        return ""
+    value = normalize(text).replace(" required", "").strip()
+    if not value or "select one" in value or value in {"select", "required"}:
+        return ""
+    return text
+
+
+def _text_current(page, question_fragment, occurrence=0):
+    _frame, element = find_question_control(
+        page,
+        question_fragment,
+        'textarea, input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"])',
+        occurrence=occurrence,
+    )
+    if element is None:
+        return ""
+    try:
+        return element.input_value(timeout=500).strip()
+    except Exception:
+        return ""
+
+
+def conflict_page_has_user_values(page):
+    """
+    Detect a conflict page that the user has already completed manually.
+
+    This does not learn or infer the answers. It only permits navigation after
+    the user supplied every required value. The final submission policy still
+    classifies this page as conflict_of_interest and blocks automatic submit.
+    """
+    checks = [
+        _dropdown_current(page, "Are you a relative of a current Public Official?"),
+        _text_current(page, "If yes, what is your relationship with this individual?", 0),
+        _text_current(page, "If yes, please list the institution name and level of the individual.", 0),
+        _dropdown_current(page, "Are you a relative of a current senior level person"),
+        _text_current(page, "If yes, what is your relationship with this individual?", 1),
+        _text_current(page, "If yes, please list the institution name and level of the individual.", 1),
+        _dropdown_current(page, "Please select one of the below options:"),
+        _text_current(page, "Enter your name (required) and the name of your agency"),
+    ]
+    return all(bool(str(value).strip()) for value in checks)
+
+
 def select_question(page, question_fragment, desired, occurrence=0):
     frame, button = find_question_control(
         page,
@@ -323,6 +378,13 @@ def inspect_dropdown_options(page, question_fragment, occurrence=0):
 def fill_conflict_questions(page, profile):
     print(f"\nworkday_conflict_questions.py VERSION {VERSION}")
 
+    # If the user already completed every required control during a manual
+    # review cycle, do not force those sensitive answers into the profile or
+    # learned memory. Just allow the adapter to validate/advance the page.
+    if conflict_page_has_user_values(page):
+        print("USER_PROVIDED          conflict page complete")
+        return {"ready": True, "source": "USER_PROVIDED"}
+
     prefix = "application_questions.conflicts_of_interest."
 
     public_relative = profile_value(profile, prefix + "relative_public_official")
@@ -451,4 +513,4 @@ def fill_conflict_questions(page, profile):
     ):
         return {"ready": False, "reason": "name_and_agency"}
 
-    return {"ready": True}
+    return {"ready": True, "source": "LOCKED_PROFILE"}
