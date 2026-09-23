@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional
 
-from learning.application_memory import ApplicationMemory, is_sensitive_question
+from learning.application_memory import (
+    ApplicationMemory,
+    is_placeholder_answer,
+    is_sensitive_question,
+)
 
 
 SKIP_LABELS = {
@@ -254,6 +258,8 @@ class ReviewCapture:
             current_answer = current.answer.strip()
 
             if not current_answer:
+                continue
+            if is_placeholder_answer(current_answer):
                 continue
             if previous_answer == current_answer:
                 continue
