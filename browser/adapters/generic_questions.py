@@ -23,6 +23,16 @@ STANDARD_NAMES = {
     "website",
 }
 
+PLACEHOLDER_VALUES = {
+    "",
+    "select",
+    "select one",
+    "please select",
+    "choose",
+    "choose one",
+    "--",
+}
+
 
 def _norm(value) -> str:
     return " ".join(str(value or "").strip().lower().split())
@@ -116,6 +126,83 @@ def _select_option(element, answer: str) -> bool:
     return False
 
 
+def _radio_group_answer(frame, element) -> str:
+    try:
+        name = element.get_attribute("name")
+    except Exception:
+        name = None
+
+    if not name:
+        return ""
+
+    try:
+        radios = frame.locator(f'input[type="radio"][name="{name}"]')
+    except Exception:
+        return ""
+
+    for index in range(radios.count()):
+        radio = radios.nth(index)
+        try:
+            if not radio.is_checked():
+                continue
+        except Exception:
+            continue
+
+        try:
+            radio_id = radio.get_attribute("id")
+        except Exception:
+            radio_id = None
+
+        if radio_id:
+            try:
+                label = frame.locator(f'label[for="{radio_id}"]')
+                if label.count():
+                    text = label.first.inner_text(timeout=300).strip()
+                    if text:
+                        return " ".join(text.split())
+            except Exception:
+                pass
+
+        try:
+            return str(radio.get_attribute("value") or "").strip()
+        except Exception:
+            return ""
+
+    return ""
+
+
+def _existing_answer(frame, element, field_type: str, tag: str) -> str:
+    if field_type == "radio":
+        return _radio_group_answer(frame, element)
+
+    if field_type == "checkbox":
+        try:
+            return "Yes" if element.is_checked() else ""
+        except Exception:
+            return ""
+
+    if tag == "select":
+        try:
+            selected = element.locator("option:checked")
+            if selected.count():
+                text = selected.first.inner_text(timeout=300).strip()
+                if _norm(text) not in PLACEHOLDER_VALUES:
+                    return text
+        except Exception:
+            pass
+        try:
+            value = element.input_value(timeout=300).strip()
+            return value if _norm(value) not in PLACEHOLDER_VALUES else ""
+        except Exception:
+            return ""
+
+    try:
+        value = element.input_value(timeout=300).strip()
+        return value if _norm(value) not in PLACEHOLDER_VALUES else ""
+    except Exception:
+        return ""
+
+
 def _radio_answer(frame, element, answer: str) -> bool:
     desired = _norm(answer)
     try:
@@ -154,6 +241,20 @@ def _radio_answer(frame, element, answer: str) -> bool:
                 continue
 
     return False
+
+
+def _user_provided_decision(decision, answer: str) -> Dict:
+    item = decision.to_dict()
+    item.update(
+        {
+            "answer": answer,
+            "source": "USER_PROVIDED",
+            "confidence": 1.0,
+            "review_required": False,
+            "rationale": "The field already contains a user-provided value after manual review.",
+        }
+    )
+    return item
 
 
 def fill_generic_form_questions(
@@ -212,13 +313,23 @@ def fill_generic_form_questions(
 
                 required = _required(element, question)
 
-                # One decision per radio group.
                 group_key = (name, _norm(question)) if field_type == "radio" else (index, _norm(question))
                 if group_key in seen_groups:
                     continue
                 seen_groups.add(group_key)
 
                 decision = engine.answer_question(question, job_text=job_text)
+                existing = _existing_answer(frame, element, field_type, tag)
+
+                # Manual review may already have supplied a required sensitive or
+                # otherwise review-only value. Accept the presence of that value
+                # for navigation, while preserving the category so safe-submit
+                # policy can still require final manual confirmation where needed.
+                if (decision.review_required or decision.answer is None) and existing:
+                    decisions.append(_user_provided_decision(decision, existing))
+                    handled += 1
+                    continue
+
                 decisions.append(decision.to_dict())
 
                 if decision.review_required or decision.answer is None:
@@ -237,7 +348,7 @@ def fill_generic_form_questions(
                     success = _radio_answer(frame, element, answer)
                 elif tag == "select":
                     success = _select_option(element, answer)
-                elif field_type in {"checkbox"}:
+                elif field_type == "checkbox":
                     desired = _norm(answer)
                     if desired in {"yes", "true", "1"}:
                         try:
@@ -252,11 +363,7 @@ def fill_generic_form_questions(
                         except Exception:
                             success = False
                 else:
-                    try:
-                        current = element.input_value(timeout=500).strip()
-                    except Exception:
-                        current = ""
-                    if current:
+                    if existing:
                         success = True
                     else:
                         try:
