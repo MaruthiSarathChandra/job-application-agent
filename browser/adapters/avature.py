@@ -22,6 +22,19 @@ CLOSED_MARKERS = (
     "job has expired",
 )
 
+FINAL_REVIEW_MARKERS = (
+    "i acknowledge",
+    "acknowledge",
+    "certify",
+    "attest",
+    "review your application",
+    "review application",
+    "final review",
+    "terms and conditions",
+    "submit application",
+    "complete application",
+)
+
 
 def _norm(value: str) -> str:
     return " ".join(str(value or "").strip().lower().split())
@@ -252,6 +265,42 @@ class AvatureAdapter(ATSAdapter):
                 except Exception:
                     continue
         return None
+
+    @staticmethod
+    def _navigation_may_submit(page, control) -> bool:
+        """
+        Avature tenants sometimes label their final submit control as Continue.
+
+        Treat a submit-typed Continue/Next control on a final review or attestation
+        surface as a submission action so it must pass SubmissionPolicy instead of
+        bypassing manual mode through the ordinary navigation path.
+        """
+        try:
+            tag = _norm(control.evaluate("el => el.tagName.toLowerCase()"))
+        except Exception:
+            tag = ""
+        try:
+            control_type = _norm(control.get_attribute("type"))
+        except Exception:
+            control_type = ""
+        try:
+            label = _norm(
+                control.get_attribute("aria-label")
+                or control.get_attribute("value")
+                or control.inner_text(timeout=300)
+            )
+        except Exception:
+            label = ""
+
+        if any(token in label for token in ("submit", "finish", "complete application")):
+            return True
+
+        submit_typed = control_type == "submit" and tag in {"button", "input"}
+        if not submit_typed:
+            return False
+
+        page_text = _norm(AvatureAdapter._page_text(page))
+        return any(marker in page_text for marker in FINAL_REVIEW_MARKERS)
 
     @staticmethod
     def _application_surface_present(page) -> bool:
@@ -530,6 +579,28 @@ class AvatureAdapter(ATSAdapter):
                     decisions=decisions,
                     metadata=self._metadata(active, standard_fields=standard, resume_uploaded=resume_seen),
                 )
+
+            if self._navigation_may_submit(active, next_button):
+                submission = SubmissionPolicy(context.submission_mode).decide(
+                    decisions,
+                    validation_errors=[],
+                )
+                if not submission.may_submit:
+                    return AdapterResult(
+                        status="ready_for_review",
+                        submitted=False,
+                        message=(
+                            "Avature final Continue/Next control may submit the application. "
+                            f"{submission.reason}"
+                        ),
+                        decisions=decisions,
+                        metadata=self._metadata(
+                            active,
+                            standard_fields=standard,
+                            resume_uploaded=resume_seen,
+                            navigation_submission_guard=True,
+                        ),
+                    )
 
             before_pages = list(active.context.pages)
             try:
