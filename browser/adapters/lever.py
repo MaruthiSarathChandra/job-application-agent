@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Iterable
 
 from agent.submission_policy import SubmissionPolicy
+from browser.submission_detector import detect_submission_confirmation
 from learning.application_memory import ApplicationMemory
 from pipeline.ats import ATS_LEVER, detect_ats
 
@@ -54,10 +55,28 @@ class LeverAdapter(ATSAdapter):
             return False
 
     @staticmethod
+    def _resume_present(page, resume_path: str) -> bool:
+        name = Path(resume_path).name.lower()
+        if not name:
+            return False
+        for frame in page.frames:
+            try:
+                body = frame.locator("body")
+                if body.count() and body.first.is_visible():
+                    if name in body.first.inner_text(timeout=700).lower():
+                        return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
     def _upload_resume(page, resume_path: str) -> bool:
         path = Path(resume_path)
         if not path.exists() or not path.is_file():
             return False
+
+        if LeverAdapter._resume_present(page, resume_path):
+            return True
 
         for frame in page.frames:
             try:
@@ -68,7 +87,7 @@ class LeverAdapter(ATSAdapter):
                 element = inputs.nth(index)
                 try:
                     element.set_input_files(str(path.resolve()))
-                    page.wait_for_timeout(700)
+                    page.wait_for_timeout(900)
                     return True
                 except Exception:
                     continue
@@ -97,8 +116,19 @@ class LeverAdapter(ATSAdapter):
         return None
 
     def run(self, page, profile, context: ApplicationContext) -> AdapterResult:
-        page.goto(context.job.url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(900)
+        resume_current = bool(context.metadata.get("resume_current_page"))
+        if not resume_current:
+            page.goto(context.job.url, wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(900)
+        else:
+            page.wait_for_timeout(350)
+
+        if detect_submission_confirmation(page):
+            return AdapterResult(
+                status="submitted",
+                submitted=True,
+                message="Lever submission confirmation detected.",
+            )
 
         legal_name = profile.get("candidate.legal_name") or ""
         email = profile.get("candidate.email")
@@ -158,7 +188,7 @@ class LeverAdapter(ATSAdapter):
 
         blockers = list(questions.get("blockers") or [])
         submit = self._submit(page)
-        if submit is None:
+        if submit is None and not detect_submission_confirmation(page):
             blockers.append({
                 "category": "submit_control",
                 "reason": "Lever submit control was not found.",
@@ -188,11 +218,20 @@ class LeverAdapter(ATSAdapter):
 
         try:
             submit.click(timeout=5000)
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(1400)
+            if detect_submission_confirmation(page):
+                return AdapterResult(
+                    status="submitted",
+                    submitted=True,
+                    message="Lever application submitted and confirmation detected.",
+                    decisions=decisions,
+                    metadata={"standard_fields": standard, "resume_uploaded": True},
+                )
             return AdapterResult(
-                status="submitted",
-                submitted=True,
-                message="Lever submit control was clicked after the safe-submit policy passed.",
+                status="review",
+                review_required=True,
+                message="Lever submit was clicked, but no submission confirmation was detected.",
+                blockers=[{"category": "submit_confirmation", "reason": "confirmation_not_detected"}],
                 decisions=decisions,
                 metadata={"standard_fields": standard, "resume_uploaded": True},
             )
