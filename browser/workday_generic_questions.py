@@ -29,6 +29,17 @@ NAV_LABELS = {
     "submit",
 }
 
+PLACEHOLDER_VALUES = {
+    "",
+    "select",
+    "select one",
+    "select one required",
+    "please select",
+    "choose",
+    "choose one",
+    "required",
+}
+
 
 def _visible(element) -> bool:
     try:
@@ -71,8 +82,6 @@ def _clean_question_text(text: str) -> str:
     if not kept:
         return ""
 
-    # Prefer question-like text over option values. This prevents an open
-    # Workday prompt from turning values such as company names into questions.
     for line in kept:
         if "?" in line and len(line) >= 8:
             return line[:1200]
@@ -127,7 +136,6 @@ def question_for_field(field) -> str:
     label = str(field.get("label") or "").strip()
     normalized_label = normalize_text(label).replace("*", "").strip()
 
-    # A normal full label is usually the safest source.
     if (
         normalized_label not in GENERIC_LABELS
         and normalized_label not in NAV_LABELS
@@ -177,6 +185,95 @@ def _current_text(element) -> str:
         return str(element.inner_text()).strip()
     except Exception:
         return ""
+
+
+def _radio_group_existing(field) -> str:
+    element = field["_element"]
+    frame = field["_frame"]
+    try:
+        name = element.get_attribute("name")
+    except Exception:
+        name = None
+    if not name:
+        return ""
+
+    try:
+        radios = frame.locator(f'input[type="radio"][name="{name}"]')
+    except Exception:
+        return ""
+
+    for index in range(radios.count()):
+        radio = radios.nth(index)
+        try:
+            if not radio.is_checked():
+                continue
+        except Exception:
+            continue
+
+        try:
+            radio_id = radio.get_attribute("id")
+        except Exception:
+            radio_id = None
+        if radio_id:
+            try:
+                label = frame.locator(f'label[for="{radio_id}"]')
+                if label.count():
+                    text = label.first.inner_text(timeout=300).strip()
+                    if text:
+                        return " ".join(text.split())
+            except Exception:
+                pass
+
+        try:
+            return str(radio.get_attribute("value") or "").strip()
+        except Exception:
+            return ""
+
+    return ""
+
+
+def _existing_answer(field) -> str:
+    element = field["_element"]
+    tag = normalize_text(field.get("tag") or "")
+    role = normalize_text(field.get("role") or "")
+    field_type = normalize_text(field.get("type") or "")
+    popup = normalize_text(field.get("aria_haspopup") or "")
+
+    if field_type == "radio" or role == "radio":
+        return _radio_group_existing(field)
+
+    if field_type == "checkbox" or role == "checkbox":
+        try:
+            return "Yes" if element.is_checked() else ""
+        except Exception:
+            return ""
+
+    current = _current_text(element).strip()
+    normalized = normalize_text(current)
+
+    if tag == "button" or role == "combobox" or popup == "listbox":
+        normalized = normalized.replace(" required", "").strip()
+        if normalized in PLACEHOLDER_VALUES or "select one" in normalized:
+            return ""
+        return current
+
+    if normalized in PLACEHOLDER_VALUES:
+        return ""
+    return current
+
+
+def _user_provided_decision(decision, answer: str) -> Dict:
+    item = decision.to_dict()
+    item.update(
+        {
+            "answer": answer,
+            "source": "USER_PROVIDED",
+            "confidence": 1.0,
+            "review_required": False,
+            "rationale": "The field already contains a user-provided value after manual review.",
+        }
+    )
+    return item
 
 
 def _select_workday_option(page, field, desired: str) -> bool:
@@ -328,15 +425,10 @@ def fill_generic_questions(
     memory=None,
 ) -> Dict:
     """
-    Fill only answers backed by locked profile facts, repeatedly confirmed
-    non-sensitive memory, or a high-confidence LLM decision.
-
-    Sensitive/legal/immigration/salary/demographic questions remain REVIEW.
+    Fill answers backed by locked profile facts, repeated non-sensitive memory,
+    or a high-confidence LLM decision. Existing user-filled review fields are
+    accepted for navigation but remain categorized for the safe-submit policy.
     """
-
-    # Close any leftover prompt from the previous wizard section before field
-    # discovery. This was the cause of option values being interpreted as
-    # standalone questions in earlier State Street runs.
     close_workday_prompt(page)
     page.wait_for_timeout(150)
 
@@ -378,6 +470,14 @@ def fill_generic_questions(
                 continue
 
             decision = engine.answer_question(question, job_text=job_text)
+            existing = _existing_answer(field)
+
+            if (decision.review_required or decision.answer is None) and existing:
+                if question_norm not in seen_questions:
+                    decisions.append(_user_provided_decision(decision, existing))
+                    seen_questions.add(question_norm)
+                handled += 1
+                continue
 
             if question_norm not in seen_questions:
                 decisions.append(decision.to_dict())
