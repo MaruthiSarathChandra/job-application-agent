@@ -3,6 +3,7 @@ from __future__ import annotations
 from pipeline.ats import (
     ATS_AVATURE,
     ATS_BRASSRING,
+    ATS_CAREER_SITE,
     ATS_GREENHOUSE,
     ATS_LEVER,
     ATS_WORKDAY,
@@ -11,6 +12,7 @@ from pipeline.ats import (
 
 from .avature import AvatureAdapter
 from .brassring import BrassRingAdapter
+from .generic_career import GenericCareerSiteAdapter
 from .greenhouse import GreenhouseAdapter
 from .lever import LeverAdapter
 from .workday import WorkdayAdapter
@@ -22,6 +24,7 @@ ADAPTERS = {
     ATS_WORKDAY: WorkdayAdapter,
     ATS_BRASSRING: BrassRingAdapter,
     ATS_AVATURE: AvatureAdapter,
+    ATS_CAREER_SITE: GenericCareerSiteAdapter,
 }
 
 
