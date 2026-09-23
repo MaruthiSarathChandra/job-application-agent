@@ -13,11 +13,52 @@ from .base import AdapterResult, ApplicationContext, ATSAdapter
 from .generic_questions import fill_generic_form_questions
 
 
+CLOSED_MARKERS = (
+    "job posting you are looking for has expired",
+    "position has already been filled",
+    "this link is no longer valid",
+    "job is no longer available",
+    "job is no longer active",
+)
+
+ALREADY_APPLIED_MARKERS = (
+    "you have already applied for this job",
+    "we only allow one application for this job and you have already applied",
+)
+
+
+def _norm(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def classify_brassring_page(text: str):
+    normalized = _norm(text)
+    for marker in ALREADY_APPLIED_MARKERS:
+        if marker in normalized:
+            return "already_applied", marker
+    for marker in CLOSED_MARKERS:
+        if marker in normalized:
+            return "closed", marker
+    return "open", ""
+
+
 class BrassRingAdapter(ATSAdapter):
     name = ATS_BRASSRING
 
     def supports(self, job) -> bool:
         return detect_ats(job.url) == ATS_BRASSRING
+
+    @staticmethod
+    def _page_text(page) -> str:
+        parts = []
+        for frame in page.frames:
+            try:
+                body = frame.locator("body")
+                if body.count() and body.first.is_visible():
+                    parts.append(body.first.inner_text(timeout=900))
+            except Exception:
+                continue
+        return "\n".join(parts)
 
     @staticmethod
     def _first_visible(page, selectors: Iterable[str]):
@@ -94,19 +135,29 @@ class BrassRingAdapter(ATSAdapter):
         if BrassRingAdapter._resume_present(page, resume_path):
             return True
 
+        # BrassRing often hides the upload input behind its Quick Apply modal.
+        # Hidden file controls are still safe to populate directly with Playwright.
+        selectors = (
+            'input[type="file"][name*="resume" i]',
+            'input[type="file"][id*="resume" i]',
+            'input[type="file"][aria-label*="resume" i]',
+            'input[type="file"][accept*="pdf" i]',
+            'input[type="file"]',
+        )
         for frame in page.frames:
-            try:
-                inputs = frame.locator('input[type="file"]')
-            except Exception:
-                continue
-            for index in range(inputs.count()):
-                element = inputs.nth(index)
+            for selector in selectors:
                 try:
-                    element.set_input_files(str(path.resolve()))
-                    page.wait_for_timeout(900)
-                    return True
+                    inputs = frame.locator(selector)
                 except Exception:
                     continue
+                for index in range(inputs.count()):
+                    element = inputs.nth(index)
+                    try:
+                        element.set_input_files(str(path.resolve()))
+                        page.wait_for_timeout(1000)
+                        return True
+                    except Exception:
+                        continue
         return False
 
     @staticmethod
@@ -140,30 +191,83 @@ class BrassRingAdapter(ATSAdapter):
         apply = self._button_or_link(
             page,
             (
-                "Apply",
+                "Quick Apply",
                 "Apply Now",
                 "Apply now",
                 "Apply for this job",
                 "Apply to this job",
+                "Apply",
             ),
         )
         if apply is None:
             return False
         try:
             apply.click(timeout=5000)
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(1500)
             return True
         except Exception:
             return False
+
+    def _application_surface_present(self, page) -> bool:
+        selectors = (
+            'input[type="file"]',
+            'input[type="email"]',
+            'input[name*="first" i]',
+            'input[name*="last" i]',
+            'textarea',
+        )
+        return self._first_visible(page, selectors) is not None or self._find_submit(page) is not None
+
+    def _preflight_result(self, page):
+        status, reason = classify_brassring_page(self._page_text(page))
+        if status == "closed":
+            return AdapterResult(
+                status="closed",
+                review_required=False,
+                submitted=False,
+                message="BrassRing job is closed/expired; application was skipped.",
+                blockers=[{"category": "job_availability", "reason": reason}],
+            )
+        if status == "already_applied":
+            return AdapterResult(
+                status="already_applied",
+                review_required=False,
+                submitted=False,
+                message="BrassRing reports that this job was already applied to; skipped duplicate application.",
+                blockers=[],
+            )
+        return None
 
     def run(self, page, profile, context: ApplicationContext) -> AdapterResult:
         resume_current = bool(context.metadata.get("resume_current_page"))
         if not resume_current:
             page.goto(context.job.url, wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(1200)
-            self._open_application(page)
+            page.wait_for_timeout(1600)
+
+            preflight = self._preflight_result(page)
+            if preflight is not None:
+                return preflight
+
+            opened = self._open_application(page)
+            if opened:
+                page.wait_for_timeout(500)
+
+            preflight = self._preflight_result(page)
+            if preflight is not None:
+                return preflight
+
+            if not opened and not self._application_surface_present(page):
+                return AdapterResult(
+                    status="review",
+                    review_required=True,
+                    message="BrassRing Apply/Quick Apply control was not found or did not open an application form.",
+                    blockers=[{"category": "apply_control", "reason": "application_surface_not_open"}],
+                )
         else:
             page.wait_for_timeout(350)
+            preflight = self._preflight_result(page)
+            if preflight is not None:
+                return preflight
 
         if detect_submission_confirmation(page):
             return AdapterResult(
@@ -246,7 +350,11 @@ class BrassRingAdapter(ATSAdapter):
                 review_required=True,
                 message="BrassRing resume upload control was not found or could not be filled.",
                 blockers=[{"category": "resume", "reason": "resume_upload_failed"}],
-                metadata={"standard_fields": standard, "account_state": account.state},
+                metadata={
+                    "standard_fields": standard,
+                    "account_state": account.state,
+                    "page_url": page.url,
+                },
             )
 
         memory = ApplicationMemory()

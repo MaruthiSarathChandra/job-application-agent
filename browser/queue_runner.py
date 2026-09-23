@@ -89,6 +89,29 @@ def _result_payload(job_id, run_id, adapter_name, status, result):
     }
 
 
+def _blocker_fingerprint(result) -> str:
+    blockers = result.blockers or []
+    normalized = []
+    for item in blockers:
+        if not isinstance(item, dict):
+            normalized.append(str(item))
+            continue
+        normalized.append(
+            "|".join(
+                str(item.get(key) or "").strip().lower()
+                for key in ("category", "reason", "question", "label")
+            )
+        )
+    return json.dumps(
+        {
+            "status": str(result.status or "").lower(),
+            "message": str(result.message or "").strip().lower(),
+            "blockers": sorted(normalized),
+        },
+        sort_keys=True,
+    )
+
+
 def run_queue(
     profile_path: str,
     db_path: str,
@@ -195,6 +218,8 @@ def run_queue(
                 store.set_application_status(job_id, "in_progress")
                 final_result = None
                 final_status = "error"
+                previous_manual_fingerprint = None
+                previous_manual_learned = None
 
                 for manual_cycle in range(max_manual_cycles + 1):
                     try:
@@ -234,6 +259,24 @@ def run_queue(
                         break
 
                     if not stop_on_review:
+                        break
+
+                    current_fingerprint = _blocker_fingerprint(result)
+                    if (
+                        previous_manual_fingerprint is not None
+                        and current_fingerprint == previous_manual_fingerprint
+                        and previous_manual_learned == 0
+                    ):
+                        print(
+                            "\nNo progress detected: the same blocker returned after the "
+                            "previous manual step, so the agent will stop instead of asking "
+                            "you to repeat the same action."
+                        )
+                        audit.event(
+                            run_id,
+                            "manual_review_no_progress",
+                            {"cycle": manual_cycle, "status": status},
+                        )
                         break
 
                     before = trainer.capture(page)
@@ -276,8 +319,6 @@ def run_queue(
                         final_status = "submitted"
                         break
 
-                    # Final-review pages are intentionally not looped forever in
-                    # manual mode. If the user did not submit, keep the job queued.
                     if status == "ready_for_review":
                         final_status = "ready_for_review"
                         break
@@ -286,9 +327,8 @@ def run_queue(
                         final_status = status
                         break
 
-                    # Continue the SAME browser page. Adapters skip navigation on
-                    # the next cycle so manually entered values and verification
-                    # state are preserved.
+                    previous_manual_fingerprint = current_fingerprint
+                    previous_manual_learned = len(learned)
                     application.metadata["resume_current_page"] = True
                     print("\nResuming the same application automatically...")
 
