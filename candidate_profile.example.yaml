@@ -1,0 +1,101 @@
+candidate:
+  legal_name: "Example Candidate"
+  preferred_name: "Example"
+  email: "candidate@example.com"
+  phone: "5555550100"
+  location: "Example City, ST"
+  linkedin: "https://www.linkedin.com/in/example-candidate"
+  github: "https://github.com/example-candidate"
+
+education:
+  highest_degree: "MS Computer Science"
+  university: "Example University"
+  graduation_date: "2025-12-01"
+
+application_defaults:
+  first_name: "Example"
+  last_name: "Candidate"
+  address_line1: ""
+  address_line2: ""
+  city: "Example City"
+  state: "Example State"
+  postal_code: "00000"
+  county: ""
+  country: "United States of America"
+  country_phone_code: "+1"
+  phone_number: "5555550100"
+  phone_extension: ""
+  phone_device_type: "Mobile"
+  job_source: "Indeed"
+
+preferences:
+  target_roles:
+    - "Backend Software Engineer"
+    - "Software Engineer"
+    - "Java Developer"
+  willing_to_relocate: true
+  remote_ok: true
+  onsite_ok: true
+  hybrid_ok: true
+
+work_authorization:
+  currently_authorized_us:
+    value: "REVIEW"
+    locked: true
+  requires_sponsorship_now:
+    value: "REVIEW"
+    locked: true
+  requires_sponsorship_future:
+    value: "REVIEW"
+    locked: true
+
+employment_history:
+  previous_employers: []
+
+verified_facts:
+  skills:
+    - "Java"
+    - "Spring Boot"
+    - "REST APIs"
+    - "MySQL"
+    - "Python"
+    - "AWS"
+
+resume_content:
+  headline: "Software Engineer"
+  summary: "Replace this with a verified summary that is factually yours."
+  experience:
+    - employer: "Example Employer"
+      title: "Software Engineer"
+      location: "Example City, ST"
+      dates: "Jan 2025 - Present"
+      bullets:
+        - text: "Replace this with a verified accomplishment or responsibility."
+          tags: ["Java", "Spring Boot", "REST APIs"]
+  projects:
+    - name: "Example Project"
+      tech: "Java, Spring Boot, MySQL"
+      bullets:
+        - text: "Replace this with a verified project bullet."
+          tags: ["Java", "MySQL"]
+
+# Keep legal/compliance/conflict answers explicit. Use REVIEW until you have
+# personally supplied the truthful value. Do not let the agent infer them.
+application_questions:
+  conflicts_of_interest:
+    relative_public_official: "REVIEW"
+    public_official_relationship: ""
+    public_official_institution_level: ""
+    relative_senior_commercial_person: "REVIEW"
+    senior_commercial_relationship: ""
+    senior_commercial_institution_level: ""
+    recruitment_option: "REVIEW"
+    name_and_agency: "REVIEW"
+
+submission:
+  # manual is the recommended/default mode during validation.
+  # auto_if_safe is permitted only after all adapter/policy checks pass.
+  mode: "manual"
+
+safety:
+  llm_min_confidence: 0.97
