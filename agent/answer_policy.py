@@ -19,8 +19,108 @@ class AnswerPolicy:
     def __init__(self, profile: CandidateProfile):
         self.profile = profile
 
+    def _profile_text_decision(
+        self,
+        question: str,
+        path: str,
+        category: str,
+        rationale: str = "Candidate profile.",
+    ) -> Optional[AnswerDecision]:
+        value = self.profile.get(path)
+        if value is None:
+            return None
+        value = str(value).strip()
+        if not value:
+            return None
+        return AnswerDecision(
+            question=question,
+            answer=value,
+            source="PROFILE",
+            confidence=1.0,
+            review_required=False,
+            category=category,
+            rationale=rationale,
+        )
+
     def answer_locked(self, question: str) -> Optional[AnswerDecision]:
         q = _clean(question)
+
+        # PERSONAL CONTACT / ADDRESS FIELDS
+        # These are profile facts, not facts the LLM should infer from the job
+        # description. Keep the patterns intentionally narrow so a question like
+        # "which country are you authorized to work in" is not mistaken for a
+        # mailing-address field.
+        if re.search(r"\bcountry phone code\b|\bcalling code\b|\bdial(?:ing)? code\b", q):
+            result = self._profile_text_decision(
+                question,
+                "application_defaults.country_phone_code",
+                "phone_code",
+            )
+            if result:
+                return result
+
+        if re.search(r"\bstreet name and number\b|\bstreet address\b|\baddress line ?1\b", q):
+            result = self._profile_text_decision(
+                question,
+                "application_defaults.address_line1",
+                "address",
+            )
+            if result:
+                return result
+
+        if re.search(r"\baddress line ?2\b|\bapartment\b|\bapt\.?\b|\bsuite\b", q):
+            result = self._profile_text_decision(
+                question,
+                "application_defaults.address_line2",
+                "address",
+            )
+            if result:
+                return result
+
+        if re.fullmatch(r"city\s*\*?", q) or "city of residence" in q:
+            result = self._profile_text_decision(
+                question,
+                "application_defaults.city",
+                "address",
+            )
+            if result:
+                return result
+
+        if re.fullmatch(r"(?:state|province|state/province)\s*\*?", q) or "state or province" in q:
+            result = self._profile_text_decision(
+                question,
+                "application_defaults.state",
+                "address",
+            )
+            if result:
+                return result
+
+        if re.search(r"\bpostal code\b|\bzip code\b|\bzipcode\b", q):
+            result = self._profile_text_decision(
+                question,
+                "application_defaults.postal_code",
+                "address",
+            )
+            if result:
+                return result
+
+        if re.fullmatch(r"country\s*\*?", q) or "country of residence" in q:
+            result = self._profile_text_decision(
+                question,
+                "application_defaults.country",
+                "address",
+            )
+            if result:
+                return result
+
+        if re.search(r"\bphone number\b|\bmobile number\b|\btelephone number\b", q):
+            result = self._profile_text_decision(
+                question,
+                "application_defaults.phone_number",
+                "phone",
+            )
+            if result:
+                return result
 
         # CURRENT US WORK AUTHORIZATION
         if re.search(
@@ -160,6 +260,9 @@ class AnswerPolicy:
                 r"under penalty",
                 r"signature",
                 r"terms and conditions",
+                r"\backnowledge\b",
+                r"\bi agree\b",
+                r"\baccept\b.*\bterms\b",
             ],
         }
 
