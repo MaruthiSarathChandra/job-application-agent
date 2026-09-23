@@ -1,0 +1,43 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+resumes/*.pdf
+# Secrets
+.env
+*.env
+
+# Personal candidate data
+candidate_profile.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyCharm
+.idea/
+
+# Browser profile / cookies / sessions / cache
+data/browser_profile/
+
+# Runtime/debug/application data
+data/workday_runs/
+data/*.db
+*.db
+
+# Personal resumes
+resumes/*.pdf
+resumes/*.docx
+
+# Logs/temp
+*.log
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
