@@ -8,6 +8,7 @@ ATS_WORKDAY = "workday"
 ATS_LEVER = "lever"
 ATS_LINKEDIN = "linkedin"
 ATS_BRASSRING = "brassring"
+ATS_AVATURE = "avature"
 ATS_CAREER_SITE = "career_site"
 
 
@@ -32,6 +33,9 @@ def detect_ats(url: str) -> str:
     if "brassring.com" in host or "sjobs.brassring.com" in host:
         return ATS_BRASSRING
 
+    if "avature.net" in host or host.endswith("metlifecareers.com"):
+        return ATS_AVATURE
+
     if "linkedin.com" in host:
         return ATS_LINKEDIN
 
@@ -55,4 +59,5 @@ def is_direct_application_target(url: str) -> bool:
         ATS_WORKDAY,
         ATS_LEVER,
         ATS_BRASSRING,
+        ATS_AVATURE,
     }
