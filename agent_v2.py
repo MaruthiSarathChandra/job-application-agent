@@ -103,13 +103,22 @@ def _prepare(profile, jobs, args):
         if jobs:
             ingested_ids = orchestrator.ingest(jobs)
 
-        # A job can be marked adapter_missing on an older run and later gain an
-        # adapter after the agent is upgraded. Recover it automatically instead
-        # of requiring the user to delete the database or edit status by hand.
+        # Rediscovery is also our crash-recovery boundary. An older code version
+        # may have left a job in adapter_missing, while an interrupted browser
+        # run can leave application_status=in_progress forever. Both states must
+        # be made resumable without asking the user to edit SQLite by hand.
         for job_id in ingested_ids:
             row = store.get(str(job_id))
-            if row is not None and row["application_status"] == "adapter_missing":
+            if row is None:
+                continue
+            status = str(row["application_status"] or "").strip().lower()
+            if status == "adapter_missing":
                 store.set_application_status(str(job_id), "not_started")
+            elif status == "in_progress":
+                # Preserve the fact that this may be a partially completed
+                # application. The browser profile/session can resume it, and
+                # review is already part of the default resumable queue.
+                store.set_application_status(str(job_id), "review")
 
         ranked = orchestrator.rank_all(limit=args.scan_limit)
         prepared = orchestrator.prepare_resumes(
