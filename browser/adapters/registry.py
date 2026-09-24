@@ -15,13 +15,13 @@ from .brassring import BrassRingAdapter
 from .generic_career import GenericCareerSiteAdapter
 from .greenhouse import GreenhouseAdapter
 from .lever import LeverAdapter
-from .workday import WorkdayAdapter
+from .workday_autonomous import AutonomousWorkdayAdapter
 
 
 ADAPTERS = {
     ATS_GREENHOUSE: GreenhouseAdapter,
     ATS_LEVER: LeverAdapter,
-    ATS_WORKDAY: WorkdayAdapter,
+    ATS_WORKDAY: AutonomousWorkdayAdapter,
     ATS_BRASSRING: BrassRingAdapter,
     ATS_AVATURE: AvatureAdapter,
     ATS_CAREER_SITE: GenericCareerSiteAdapter,
