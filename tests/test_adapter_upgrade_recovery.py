@@ -10,12 +10,10 @@ from pipeline.models import JobLead
 
 
 class AdapterUpgradeRecoveryTests(unittest.TestCase):
-    def test_adapter_missing_job_is_requeued_after_upgrade(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            profile_path = root / "candidate_profile.yaml"
-            profile_path.write_text(
-                """
+    def _profile_and_args(self, root, db):
+        profile_path = root / "candidate_profile.yaml"
+        profile_path.write_text(
+            """
 candidate:
   legal_name: Example Candidate
   email: candidate@example.com
@@ -24,9 +22,22 @@ preferences:
 verified_facts:
   skills: [Python]
 """.strip(),
-                encoding="utf-8",
-            )
+            encoding="utf-8",
+        )
+        args = SimpleNamespace(
+            db=db,
+            scan_limit=10,
+            minimum_score=0,
+            output_dir=str(root / "resumes"),
+            prepare_limit=0,
+        )
+        return CandidateProfile(str(profile_path)), args
+
+    def test_adapter_missing_job_is_requeued_after_upgrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
             db = str(root / "jobs.db")
+            profile, args = self._profile_and_args(root, db)
             job = JobLead(
                 source="career_site",
                 company="Example",
@@ -41,19 +52,40 @@ verified_facts:
             finally:
                 store.close()
 
-            args = SimpleNamespace(
-                db=db,
-                scan_limit=10,
-                minimum_score=0,
-                output_dir=str(root / "resumes"),
-                prepare_limit=0,
-            )
-            _prepare(CandidateProfile(str(profile_path)), [job], args)
+            _prepare(profile, [job], args)
 
             store = JobStore(db)
             try:
                 row = store.get(job_id)
                 self.assertEqual(row["application_status"], "not_started")
+            finally:
+                store.close()
+
+    def test_interrupted_in_progress_job_is_requeued_for_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = str(root / "jobs.db")
+            profile, args = self._profile_and_args(root, db)
+            job = JobLead(
+                source="workday",
+                company="Example",
+                title="Software Engineer",
+                url="https://example.wd1.myworkdayjobs.com/External/job/Test/Software-Engineer_R1/apply",
+            )
+
+            store = JobStore(db)
+            try:
+                job_id = store.upsert(job)
+                store.set_application_status(job_id, "in_progress")
+            finally:
+                store.close()
+
+            _prepare(profile, [job], args)
+
+            store = JobStore(db)
+            try:
+                row = store.get(job_id)
+                self.assertEqual(row["application_status"], "review")
             finally:
                 store.close()
 
