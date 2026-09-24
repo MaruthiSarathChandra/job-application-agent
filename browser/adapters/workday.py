@@ -4,7 +4,7 @@ from agent.submission_policy import SubmissionPolicy
 from browser.account_manager import handle_account_page
 from browser.submission_detector import detect_submission_confirmation
 from browser.workday_conflict_questions import fill_conflict_questions
-from browser.workday_experience import fill_experience_and_education
+from browser.workday_experience_resilient import fill_experience_and_education
 from browser.workday_generic_questions import fill_generic_questions
 from browser.workday_router import wait_for_application_step, wait_for_step_change
 from browser.workday_runner import (
@@ -13,6 +13,7 @@ from browser.workday_runner import (
     find_submit_button,
     upload_resume,
 )
+from browser.workday_source import ensure_workday_job_source
 from learning.application_memory import ApplicationMemory
 from pipeline.ats import ATS_WORKDAY, detect_ats
 
@@ -285,6 +286,13 @@ class WorkdayAdapter(ATSAdapter):
                     )
 
                 if step == "my_information":
+                    # Workday source controls are hierarchical on many tenants
+                    # (for example Third Party Job Boards -> LinkedIn Job Post).
+                    # Fill this from the explicit local profile before the
+                    # generic profile-field pass so the user does not have to
+                    # open/scroll the source picker manually.
+                    ensure_workday_job_source(page, profile)
+
                     result = fill_my_information(
                         page,
                         profile,
