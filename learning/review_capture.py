@@ -49,6 +49,14 @@ def _visible(element) -> bool:
         return False
 
 
+def _safe_count(locator) -> int:
+    """Return zero when a Playwright target disappears during a capture pass."""
+    try:
+        return int(locator.count())
+    except Exception:
+        return 0
+
+
 def _question_for(frame, element) -> str:
     try:
         aria = element.get_attribute("aria-label")
@@ -65,7 +73,7 @@ def _question_for(frame, element) -> str:
     if element_id:
         try:
             label = frame.locator(f'label[for="{element_id}"]')
-            if label.count() and label.first.is_visible():
+            if _safe_count(label) and label.first.is_visible():
                 text = label.first.inner_text(timeout=400).strip()
                 if text:
                     return " ".join(text.split())[:1200]
@@ -109,12 +117,15 @@ def _question_for(frame, element) -> str:
 
 def _selected_option_text(element) -> str:
     try:
-        return element.locator("option:checked").first.inner_text(timeout=300).strip()
+        selected = element.locator("option:checked")
+        if _safe_count(selected):
+            return selected.first.inner_text(timeout=300).strip()
     except Exception:
-        try:
-            return element.input_value(timeout=300).strip()
-        except Exception:
-            return ""
+        pass
+    try:
+        return element.input_value(timeout=300).strip()
+    except Exception:
+        return ""
 
 
 def _radio_group_value(frame, element) -> str:
@@ -131,7 +142,7 @@ def _radio_group_value(frame, element) -> str:
     except Exception:
         return ""
 
-    for index in range(radios.count()):
+    for index in range(_safe_count(radios)):
         radio = radios.nth(index)
         try:
             if not radio.is_checked():
@@ -147,7 +158,7 @@ def _radio_group_value(frame, element) -> str:
         if radio_id:
             try:
                 label = frame.locator(f'label[for="{radio_id}"]')
-                if label.count():
+                if _safe_count(label):
                     text = label.first.inner_text(timeout=300).strip()
                     if text:
                         return " ".join(text.split())
@@ -183,12 +194,25 @@ class ReviewCapture:
     Only values changed by the user during that window are considered for
     learning. Checkboxes are intentionally excluded because they frequently
     represent legal terms/attestations.
+
+    A manual action can legitimately make an ATS replace or close a tab. Capture
+    therefore treats a disappearing Playwright target as an empty/partial capture
+    instead of crashing the whole application queue.
     """
 
     def capture(self, page) -> Dict[str, CapturedAnswer]:
         result: Dict[str, CapturedAnswer] = {}
 
-        for frame_index, frame in enumerate(page.frames):
+        if page is None:
+            return result
+        try:
+            if page.is_closed():
+                return result
+            frames = list(page.frames)
+        except Exception:
+            return result
+
+        for frame_index, frame in enumerate(frames):
             try:
                 controls = frame.locator(
                     'input:not([type="hidden"]):not([type="file"]):not([type="checkbox"]), '
@@ -198,8 +222,9 @@ class ReviewCapture:
                 continue
 
             seen_radio_names = set()
+            control_count = _safe_count(controls)
 
-            for index in range(controls.count()):
+            for index in range(control_count):
                 element = controls.nth(index)
                 if not _visible(element):
                     continue
