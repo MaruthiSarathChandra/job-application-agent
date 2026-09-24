@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import os
+import tempfile
 from pathlib import Path
+
+import yaml
 
 from agent.profile import CandidateProfile
 from browser.queue_runner import run_queue
@@ -133,6 +138,43 @@ def _prepare(profile, jobs, args):
     return ranked, strong, prepared
 
 
+def _runtime_profile(original_path: Path, unattended: bool = False, job_source: str = ""):
+    """
+    Build an ephemeral profile for one run when command-line execution policy
+    differs from the persistent candidate profile.
+
+    The temporary file is deleted after the run. This lets unattended mode force
+    auto_if_safe submission without rewriting the user's real YAML and lets a
+    one-off truthful source (LinkedIn, Indeed, etc.) be supplied per application.
+    """
+    profile = CandidateProfile(str(original_path))
+    data = copy.deepcopy(profile.data)
+    changed = False
+
+    if unattended:
+        submission = data.setdefault("submission", {})
+        submission["mode"] = "auto_if_safe"
+        changed = True
+
+    source = str(job_source or "").strip()
+    if source:
+        defaults = data.setdefault("application_defaults", {})
+        defaults["job_source"] = source
+        changed = True
+
+    if not changed:
+        return original_path, profile, None
+
+    fd, temp_name = tempfile.mkstemp(prefix="job_agent_runtime_", suffix=".yaml")
+    os.close(fd)
+    temp_path = Path(temp_name)
+    temp_path.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return temp_path, CandidateProfile(str(temp_path)), temp_path
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
@@ -185,6 +227,14 @@ def build_parser():
     parser.add_argument("--company", default="")
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument(
+        "--job-source",
+        default="",
+        help=(
+            "Truthful source for this run, e.g. 'LinkedIn Job Post' or 'Indeed'. "
+            "Overrides application_defaults.job_source only in an ephemeral runtime profile."
+        ),
+    )
+    parser.add_argument(
         "--workday-max-jobs",
         type=int,
         default=75,
@@ -206,48 +256,78 @@ def build_parser():
         action="store_true",
         help="Record review-required jobs and move on instead of pausing for user input.",
     )
+    parser.add_argument(
+        "--unattended",
+        action="store_true",
+        help=(
+            "Run without interactive ENTER prompts. Forces submission.mode=auto_if_safe "
+            "for this run, auto-submits only when all safe-submit checks pass, and records/"
+            "skips applications that still require CAPTCHA, MFA, legal consent, or another "
+            "unresolved review-required answer."
+        ),
+    )
     return parser
 
 
 def main():
     args = build_parser().parse_args()
-    profile_path = Path(args.profile)
-    if not profile_path.exists():
+    original_profile_path = Path(args.profile)
+    if not original_profile_path.exists():
         raise SystemExit(
-            f"Profile not found: {profile_path}. Copy candidate_profile.example.yaml "
+            f"Profile not found: {original_profile_path}. Copy candidate_profile.example.yaml "
             "to candidate_profile.yaml and fill only truthful values."
         )
 
-    profile = CandidateProfile(str(profile_path))
-    jobs, warnings = _discover(args, profile)
-    ranked, strong, prepared = _prepare(profile, jobs, args)
+    runtime_temp = None
+    try:
+        profile_path, profile, runtime_temp = _runtime_profile(
+            original_profile_path,
+            unattended=bool(args.unattended),
+            job_source=args.job_source,
+        )
 
-    prepared_ok = sum(1 for item in prepared if item.get("resume_path"))
-    print("\nV2 PIPELINE")
-    print(f"Discovered this run: {len(jobs)}")
-    print(f"Ranked in DB:        {len(ranked)}")
-    print(f"Qualified:           {len(strong)}")
-    print(f"Resumes prepared:    {prepared_ok}")
+        jobs, warnings = _discover(args, profile)
+        ranked, strong, prepared = _prepare(profile, jobs, args)
 
-    if warnings:
-        print(f"Warnings:            {len(warnings)}")
-        for item in warnings[:25]:
-            print(f" - {item.get('source')}: {item.get('url')} -> {item.get('error')}")
+        prepared_ok = sum(1 for item in prepared if item.get("resume_path"))
+        print("\nV2 PIPELINE")
+        print(f"Discovered this run: {len(jobs)}")
+        print(f"Ranked in DB:        {len(ranked)}")
+        print(f"Qualified:           {len(strong)}")
+        print(f"Resumes prepared:    {prepared_ok}")
+        print(f"Run mode:            {'unattended' if args.unattended else 'interactive'}")
 
-    if args.prepare_only:
-        print("\nPrepare-only mode complete.")
-        return
+        if args.unattended:
+            print(
+                "Unattended policy: safe deterministic/profile-backed answers may be submitted; "
+                "unresolved CAPTCHA/MFA/legal/review blockers are recorded and skipped without pausing."
+            )
 
-    run_queue(
-        profile_path=str(profile_path),
-        db_path=args.db,
-        audit_db=args.audit_db,
-        browser_profile=args.browser_profile,
-        minimum_score=args.minimum_score,
-        limit=args.apply_limit,
-        stop_on_review=not args.continue_on_review,
-        max_manual_cycles=max(0, int(args.max_manual_cycles)),
-    )
+        if warnings:
+            print(f"Warnings:            {len(warnings)}")
+            for item in warnings[:25]:
+                print(f" - {item.get('source')}: {item.get('url')} -> {item.get('error')}")
+
+        if args.prepare_only:
+            print("\nPrepare-only mode complete.")
+            return
+
+        run_queue(
+            profile_path=str(profile_path),
+            db_path=args.db,
+            audit_db=args.audit_db,
+            browser_profile=args.browser_profile,
+            minimum_score=args.minimum_score,
+            limit=args.apply_limit,
+            stop_on_review=not (args.continue_on_review or args.unattended),
+            max_manual_cycles=max(0, int(args.max_manual_cycles)),
+        )
+    finally:
+        if runtime_temp is not None:
+            try:
+                runtime_temp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
