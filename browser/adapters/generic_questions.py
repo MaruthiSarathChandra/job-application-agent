@@ -34,6 +34,13 @@ PLACEHOLDER_VALUES = {
     "--",
 }
 
+GENERIC_LABEL_TEXT = PLACEHOLDER_VALUES | {
+    "search",
+    "required",
+    "optional",
+    "dropdown",
+}
+
 PHONE_CODE_RE = re.compile(r"(?<!\d)\+\d{1,4}(?!\d)")
 
 
@@ -53,7 +60,6 @@ def _phone_codes(value: str):
 
 
 def _answers_equivalent(existing: str, answer: str) -> bool:
-    """Conservative semantic equality for controls that display decorated values."""
     existing_norm = _norm(existing)
     answer_norm = _norm(answer)
     if not existing_norm or not answer_norm:
@@ -73,8 +79,6 @@ def _answers_equivalent(existing: str, answer: str) -> bool:
     if existing_codes and answer_codes and existing_codes.intersection(answer_codes):
         return True
 
-    # Long text values are often decorated by the ATS (for example a country
-    # label followed by a code). Avoid substring matching for tiny answers.
     if len(answer_norm) >= 4 and answer_norm in existing_norm:
         return True
     if len(existing_norm) >= 4 and existing_norm in answer_norm:
@@ -82,14 +86,41 @@ def _answers_equivalent(existing: str, answer: str) -> bool:
     return False
 
 
+def _meaningful_label(value: str) -> bool:
+    normalized = _norm(value).replace("*", "").strip()
+    return bool(normalized and normalized not in GENERIC_LABEL_TEXT and len(normalized) >= 3)
+
+
 def _label_for(frame, element) -> str:
-    for attr in ("aria-label", "data-qa", "placeholder"):
+    # Strong semantic labels first. Generic placeholders such as "Select" are
+    # deliberately ignored because Rippling and other React ATS controls often
+    # use them inside an otherwise well-labelled question container.
+    for attr in ("aria-label", "data-qa"):
         try:
             value = element.get_attribute(attr)
         except Exception:
             value = None
-        if value and len(str(value).strip()) >= 4:
+        if value and _meaningful_label(str(value)):
             return str(value).strip()
+
+    try:
+        labelledby = element.get_attribute("aria-labelledby")
+    except Exception:
+        labelledby = None
+    if labelledby:
+        pieces = []
+        for item_id in str(labelledby).split():
+            try:
+                target = frame.locator(f"#{item_id}")
+                if target.count():
+                    text = target.first.inner_text(timeout=400).strip()
+                    if text:
+                        pieces.append(text)
+            except Exception:
+                continue
+        combined = " ".join(pieces).strip()
+        if _meaningful_label(combined):
+            return combined
 
     try:
         element_id = element.get_attribute("id")
@@ -101,38 +132,73 @@ def _label_for(frame, element) -> str:
             label = frame.locator(f'label[for="{element_id}"]')
             if label.count() and label.first.is_visible():
                 text = label.first.inner_text(timeout=500).strip()
-                if text:
+                if _meaningful_label(text):
                     return text
         except Exception:
             pass
 
+    # Prefer nearby explicit label/legend/question text before falling back to
+    # a whole container's text. This is important for custom comboboxes where
+    # the input itself only says "Select".
     try:
         text = element.evaluate(
             """
             el => {
+                const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+                const generic = new Set(['select','select one','please select','choose','choose one','search','required','optional']);
+                const good = s => {
+                    const t = clean(s);
+                    return t.length >= 3 && !generic.has(t.toLowerCase());
+                };
+
                 const fieldset = el.closest('fieldset');
                 if (fieldset) {
                     const legend = fieldset.querySelector('legend');
-                    if (legend && legend.innerText.trim()) return legend.innerText.trim();
+                    if (legend && good(legend.innerText)) return clean(legend.innerText);
                 }
-                let node = el.parentElement;
-                for (let i = 0; i < 5 && node; i++, node = node.parentElement) {
-                    const t = (node.innerText || '').trim();
-                    if (t && t.length >= 5 && t.length < 1000) return t;
+
+                let node = el;
+                for (let i = 0; i < 7 && node; i++, node = node.parentElement) {
+                    const labels = node.querySelectorAll('label, legend, [data-testid*="label"], [class*="label" i]');
+                    for (const candidate of labels) {
+                        const t = clean(candidate.innerText || candidate.textContent);
+                        if (good(t) && t.length < 500) return t;
+                    }
+
+                    const children = Array.from(node.children || []);
+                    const index = children.indexOf(el);
+                    if (index > 0) {
+                        for (let j = index - 1; j >= 0; j--) {
+                            const t = clean(children[j].innerText || children[j].textContent);
+                            if (good(t) && t.length < 500) return t;
+                        }
+                    }
+
+                    const t = clean(node.innerText || node.textContent);
+                    if (good(t) && t.length >= 5 && t.length < 1000) return t;
                 }
                 return '';
             }
             """
         )
-        if text:
+        if text and _meaningful_label(text):
             return " ".join(str(text).split())[:1200]
     except Exception:
         pass
 
+    # Placeholder is only useful when it is actually descriptive.
     try:
-        return element.get_attribute("name") or ""
+        placeholder = element.get_attribute("placeholder")
     except Exception:
-        return ""
+        placeholder = None
+    if placeholder and _meaningful_label(str(placeholder)):
+        return str(placeholder).strip()
+
+    try:
+        name = element.get_attribute("name") or ""
+    except Exception:
+        name = ""
+    return name if _meaningful_label(name) else ""
 
 
 def _required(element, label: str) -> bool:
@@ -151,20 +217,14 @@ def _select_option(element, answer: str) -> bool:
     desired_codes = _phone_codes(answer)
     try:
         options = element.locator("option")
-        # Exact match first.
         for index in range(options.count()):
             option = options.nth(index)
             text_raw = option.inner_text(timeout=300)
             value_raw = option.get_attribute("value") or ""
-            text = _norm(text_raw)
-            value = _norm(value_raw)
-            if desired in {text, value}:
+            if desired in {_norm(text_raw), _norm(value_raw)}:
                 element.select_option(value=value_raw)
                 return True
 
-        # ATS country-code selects commonly render an answer such as +1 as
-        # "United States of America (+1)". Match the exact dial-code token,
-        # never a loose substring that could confuse +1 with +1242.
         if desired_codes:
             for index in range(options.count()):
                 option = options.nth(index)
@@ -174,7 +234,6 @@ def _select_option(element, answer: str) -> bool:
                     element.select_option(value=value_raw)
                     return True
 
-        # Conservative decorated-label fallback for longer answers.
         if len(desired) >= 4:
             for index in range(options.count()):
                 option = options.nth(index)
@@ -188,12 +247,84 @@ def _select_option(element, answer: str) -> bool:
     return False
 
 
+def _visible_options(frame):
+    results = []
+    seen = set()
+    selectors = (
+        '[role="option"]',
+        '[data-radix-collection-item]',
+        '[data-headlessui-state]',
+        'li[role="option"]',
+    )
+    for selector in selectors:
+        try:
+            options = frame.locator(selector)
+        except Exception:
+            continue
+        for index in range(min(options.count(), 100)):
+            option = options.nth(index)
+            if not _visible(option):
+                continue
+            try:
+                text = " ".join(option.inner_text(timeout=300).split())
+            except Exception:
+                text = ""
+            key = _norm(text)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            results.append((text, option))
+    return results
+
+
+def _combobox_answer(frame, element, answer: str) -> bool:
+    desired = _norm(answer)
+    if not desired:
+        return False
+
+    try:
+        element.click(timeout=2000)
+    except Exception:
+        try:
+            element.click(force=True, timeout=2000)
+        except Exception:
+            return False
+
+    try:
+        tag = _norm(element.evaluate("el => el.tagName.toLowerCase()"))
+    except Exception:
+        tag = ""
+    if tag in {"input", "textarea"}:
+        try:
+            element.fill(str(answer))
+        except Exception:
+            pass
+
+    try:
+        frame.page.wait_for_timeout(350)
+    except Exception:
+        pass
+
+    options = _visible_options(frame)
+    for text, option in options:
+        if _norm(text) == desired or _answers_equivalent(text, answer):
+            try:
+                option.click(timeout=2000)
+                return True
+            except Exception:
+                try:
+                    option.click(force=True, timeout=2000)
+                    return True
+                except Exception:
+                    continue
+    return False
+
+
 def _radio_group_answer(frame, element) -> str:
     try:
         name = element.get_attribute("name")
     except Exception:
         name = None
-
     if not name:
         return ""
 
@@ -214,7 +345,6 @@ def _radio_group_answer(frame, element) -> str:
             radio_id = radio.get_attribute("id")
         except Exception:
             radio_id = None
-
         if radio_id:
             try:
                 label = frame.locator(f'label[for="{radio_id}"]')
@@ -229,7 +359,6 @@ def _radio_group_answer(frame, element) -> str:
             return str(radio.get_attribute("value") or "").strip()
         except Exception:
             return ""
-
     return ""
 
 
@@ -301,7 +430,6 @@ def _radio_answer(frame, element, answer: str) -> bool:
                 return True
             except Exception:
                 continue
-
     return False
 
 
@@ -348,7 +476,7 @@ def fill_generic_form_questions(
         for frame in page.frames:
             try:
                 fields = frame.locator(
-                    'input:not([type="hidden"]):not([type="file"]), textarea, select'
+                    'input:not([type="hidden"]):not([type="file"]), textarea, select, [role="combobox"]'
                 )
             except Exception:
                 continue
@@ -362,8 +490,10 @@ def fill_generic_form_questions(
                     name = _norm(element.get_attribute("name"))
                     field_type = _norm(element.get_attribute("type"))
                     tag = _norm(element.evaluate("el => el.tagName.toLowerCase()"))
+                    role = _norm(element.get_attribute("role"))
+                    popup = _norm(element.get_attribute("aria-haspopup"))
                 except Exception:
-                    name = field_type = tag = ""
+                    name = field_type = tag = role = popup = ""
 
                 if name in STANDARD_NAMES:
                     continue
@@ -374,7 +504,6 @@ def fill_generic_form_questions(
                     continue
 
                 required = _required(element, question)
-
                 group_key = (name, _norm(question)) if field_type == "radio" else (index, _norm(question))
                 if group_key in seen_groups:
                     continue
@@ -383,10 +512,6 @@ def fill_generic_form_questions(
                 decision = engine.answer_question(question, job_text=job_text)
                 existing = _existing_answer(frame, element, field_type, tag)
 
-                # Manual review may already have supplied a required sensitive or
-                # otherwise review-only value. Accept the presence of that value
-                # for navigation, while preserving the category so safe-submit
-                # policy can still require final manual confirmation where needed.
                 if (decision.review_required or decision.answer is None) and existing:
                     decisions.append(_user_provided_decision(decision, existing))
                     handled += 1
@@ -406,15 +531,14 @@ def fill_generic_form_questions(
                 answer = str(decision.answer).strip()
                 success = False
 
-                # Do not fight an ATS control that already displays the same
-                # semantic value. This is important for decorated select labels
-                # such as "United States of America (+1)" versus profile "+1".
                 if existing and _answers_equivalent(existing, answer):
                     success = True
                 elif field_type == "radio":
                     success = _radio_answer(frame, element, answer)
                 elif tag == "select":
                     success = _select_option(element, answer)
+                elif role == "combobox" or popup == "listbox":
+                    success = _combobox_answer(frame, element, answer)
                 elif field_type == "checkbox":
                     desired = _norm(answer)
                     if desired in {"yes", "true", "1"}:
