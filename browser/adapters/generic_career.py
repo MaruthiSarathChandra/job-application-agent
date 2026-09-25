@@ -83,6 +83,23 @@ class GenericCareerSiteAdapter(ATSAdapter):
             return False
 
     @staticmethod
+    def _page_context_text(page, limit: int = 18000) -> str:
+        """Capture visible public job context before Apply hides/replaces it."""
+        pieces = []
+        for frame in page.frames:
+            try:
+                body = frame.locator("body")
+                if not body.count() or not body.first.is_visible():
+                    continue
+                text = body.first.inner_text(timeout=1500).strip()
+            except Exception:
+                continue
+            if text:
+                pieces.append(text)
+        value = "\n".join(pieces)
+        return value[: max(0, int(limit))]
+
+    @staticmethod
     def _application_surface_present(page) -> bool:
         selectors = (
             'input[type="file"]',
@@ -92,6 +109,7 @@ class GenericCareerSiteAdapter(ATSAdapter):
             'input[name*="last" i]',
             'textarea',
             'select',
+            '[role="combobox"]',
         )
         return GenericCareerSiteAdapter._first_visible(page, selectors) is not None
 
@@ -269,10 +287,25 @@ class GenericCareerSiteAdapter(ATSAdapter):
 
     def run(self, page, profile, context: ApplicationContext) -> AdapterResult:
         resume_current = bool(context.metadata.get("resume_current_page"))
+        job_context_text = str(
+            context.job.description
+            or context.metadata.get("generic_job_text")
+            or ""
+        ).strip()
 
         if not resume_current:
             page.goto(context.job.url, wait_until="domcontentloaded", timeout=90000)
             page.wait_for_timeout(1100)
+
+            # Direct generic ATS URLs are often ingested without metadata. Keep
+            # the visible job posting text before clicking Apply so questions such
+            # as "Why <Company>?" can be answered from the actual posting instead
+            # of being blocked for missing context.
+            if not job_context_text:
+                job_context_text = self._page_context_text(page)
+                if job_context_text:
+                    context.metadata["generic_job_text"] = job_context_text
+
             if detect_submission_confirmation(page):
                 return AdapterResult(
                     status="submitted",
@@ -295,6 +328,10 @@ class GenericCareerSiteAdapter(ATSAdapter):
         else:
             active = self._resume_page(page, context)
             active.wait_for_timeout(300)
+            if not job_context_text:
+                job_context_text = self._page_context_text(active)
+                if job_context_text:
+                    context.metadata["generic_job_text"] = job_context_text
 
         context.metadata["generic_page_url"] = active.url
         decisions = []
@@ -384,7 +421,7 @@ class GenericCareerSiteAdapter(ATSAdapter):
                     profile,
                     company=context.company or context.job.company,
                     ats=self.name,
-                    job_text=context.job.description,
+                    job_text=job_context_text,
                     memory=memory,
                 )
             finally:
@@ -400,7 +437,12 @@ class GenericCareerSiteAdapter(ATSAdapter):
                     message="Application requires review before it can continue.",
                     blockers=blockers,
                     decisions=decisions,
-                    metadata=self._metadata(active, standard_fields=standard, resume_uploaded=resume_seen),
+                    metadata=self._metadata(
+                        active,
+                        standard_fields=standard,
+                        resume_uploaded=resume_seen,
+                        job_context_chars=len(job_context_text),
+                    ),
                 )
 
             submit = self._find_submit(active)
@@ -440,14 +482,11 @@ class GenericCareerSiteAdapter(ATSAdapter):
                         metadata=self._metadata(active, resume_uploaded=resume_seen),
                     )
 
-                # Some sites use a submit-looking control to advance to a final
-                # review step. Continue only when the page changed meaningfully.
                 active.wait_for_timeout(400)
                 continue
 
             next_button = self._find_next(active)
             if next_button is not None:
-                before_url = active.url
                 try:
                     next_button.click(timeout=5000)
                     active.wait_for_timeout(1000)
@@ -461,7 +500,6 @@ class GenericCareerSiteAdapter(ATSAdapter):
                         metadata=self._metadata(active),
                     )
 
-                # A next/continue click can spawn a new tab on some portals.
                 pages = list(active.context.pages)
                 if pages and pages[-1] is not active:
                     candidate = pages[-1]
