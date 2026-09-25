@@ -49,6 +49,18 @@ work_authorization:
     value: "REVIEW"
     locked: true
 
+# Citizenship and security-clearance requirements are not inferred from work
+# authorization, nationality, visa type, or other profile fields. Keep REVIEW
+# until you personally enter the truthful value. The agent only trusts a boolean
+# when locked=true.
+eligibility:
+  us_citizen:
+    value: "REVIEW"
+    locked: true
+  has_required_security_clearance:
+    value: "REVIEW"
+    locked: true
+
 employment_history:
   previous_employers: []
 
@@ -91,6 +103,25 @@ application_questions:
     senior_commercial_institution_level: ""
     recruitment_option: "REVIEW"
     name_and_agency: "REVIEW"
+
+# Optional email-verification automation. `manual` keeps OTP/email verification
+# as a browser handoff. `gmail_api` uses Google's OAuth flow and Gmail readonly
+# scope. OAuth client secrets and per-mailbox tokens are local-only and ignored
+# by git. Verification codes are used ephemerally and are never logged or saved.
+email_verification:
+  mode: "manual"  # manual | gmail_api
+  gmail:
+    client_secret_file: "secrets/gmail_oauth_client.json"
+    token_dir: "data/gmail_tokens"
+    poll_seconds: 60
+    # Add only domains you explicitly trust for verification links that redirect
+    # outside the current ATS/career-site hostname.
+    trusted_link_domains: []
+
+# If you maintain more than one truthful resume/email identity, use separate
+# local profile files (for example candidate_profile_a.yaml and
+# candidate_profile_b.yaml) and run with --profile. Do not mix or fabricate
+# employers, dates, experience length, work authorization, or legal answers.
 
 submission:
   # manual is the recommended/default mode during validation.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Iterable
 
@@ -40,6 +41,44 @@ def classify_brassring_page(text: str):
         if marker in normalized:
             return "closed", marker
     return "open", ""
+
+
+def classify_brassring_requirements(text: str):
+    """Extract explicit hard-eligibility requirements from visible job text."""
+    normalized = _norm(text)
+
+    citizenship_required = bool(
+        re.search(r"(?:u\.s\.|us) citizenship required\??\s*yes\b", normalized)
+    )
+    clearance_required = bool(
+        re.search(r"(?:security )?clearance required\??\s*yes\b", normalized)
+    )
+
+    clearance_level = ""
+    match = re.search(
+        r"clearance level\s*(ts\/sci|top secret|secret|confidential)\b",
+        normalized,
+    )
+    if match:
+        raw = match.group(1)
+        clearance_level = raw.upper() if raw == "ts/sci" else raw.title()
+
+    return {
+        "us_citizenship_required": citizenship_required,
+        "clearance_required": clearance_required,
+        "clearance_level": clearance_level,
+    }
+
+
+def _first_locked(profile, paths):
+    for path in paths:
+        try:
+            value = profile.get_locked_value(path)
+        except Exception:
+            value = None
+        if value is not None:
+            return value
+    return None
 
 
 class BrassRingAdapter(ATSAdapter):
@@ -96,6 +135,40 @@ class BrassRingAdapter(ATSAdapter):
         return None
 
     @staticmethod
+    def _find_apply(page):
+        button = BrassRingAdapter._button_or_link(
+            page,
+            (
+                "Apply to job",
+                "Apply To Job",
+                "Quick Apply",
+                "Apply Now",
+                "Apply now",
+                "Apply for this job",
+                "Apply to this job",
+                "Apply",
+            ),
+        )
+        if button is not None:
+            return button
+
+        pattern = re.compile(r"^\s*(apply to job|quick apply|apply now|apply)\s*$", re.I)
+        for frame in page.frames:
+            for selector in ("button", "a", '[role="button"]'):
+                try:
+                    items = frame.locator(selector).filter(has_text=pattern)
+                except Exception:
+                    continue
+                for index in range(items.count()):
+                    item = items.nth(index)
+                    try:
+                        if item.is_visible() and item.is_enabled():
+                            return item
+                    except Exception:
+                        continue
+        return None
+
+    @staticmethod
     def _fill_if_empty(page, selectors, value) -> bool:
         if value is None or str(value).strip() == "":
             return False
@@ -135,8 +208,6 @@ class BrassRingAdapter(ATSAdapter):
         if BrassRingAdapter._resume_present(page, resume_path):
             return True
 
-        # BrassRing often hides the upload input behind its Quick Apply modal.
-        # Hidden file controls are still safe to populate directly with Playwright.
         selectors = (
             'input[type="file"][name*="resume" i]',
             'input[type="file"][id*="resume" i]',
@@ -187,27 +258,6 @@ class BrassRingAdapter(ATSAdapter):
                     continue
         return None
 
-    def _open_application(self, page):
-        apply = self._button_or_link(
-            page,
-            (
-                "Quick Apply",
-                "Apply Now",
-                "Apply now",
-                "Apply for this job",
-                "Apply to this job",
-                "Apply",
-            ),
-        )
-        if apply is None:
-            return False
-        try:
-            apply.click(timeout=5000)
-            page.wait_for_timeout(1500)
-            return True
-        except Exception:
-            return False
-
     def _application_surface_present(self, page) -> bool:
         selectors = (
             'input[type="file"]',
@@ -218,8 +268,65 @@ class BrassRingAdapter(ATSAdapter):
         )
         return self._first_visible(page, selectors) is not None or self._find_submit(page) is not None
 
-    def _preflight_result(self, page):
-        status, reason = classify_brassring_page(self._page_text(page))
+    def _open_application(self, page):
+        """Click Apply and return the browser page that owns the application flow."""
+        apply = self._find_apply(page)
+        if apply is None:
+            return page, False
+
+        context = page.context
+        before_pages = list(context.pages)
+        try:
+            apply.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+
+        try:
+            apply.click(timeout=7000)
+        except Exception:
+            try:
+                apply.click(timeout=3000, force=True)
+            except Exception:
+                return page, False
+
+        page.wait_for_timeout(1800)
+        new_pages = [item for item in context.pages if item not in before_pages]
+        if new_pages:
+            target = new_pages[-1]
+            try:
+                target.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            try:
+                target.bring_to_front()
+            except Exception:
+                pass
+            target.wait_for_timeout(700)
+            return target, True
+
+        return page, True
+
+    def _resume_page(self, page):
+        """Recover a popup/new-tab candidate page on a resumed manual cycle."""
+        candidates = []
+        try:
+            candidates = list(page.context.pages)
+        except Exception:
+            return page
+
+        for candidate in reversed(candidates):
+            try:
+                if candidate.is_closed():
+                    continue
+            except Exception:
+                continue
+            if self._application_surface_present(candidate):
+                return candidate
+        return candidates[-1] if candidates else page
+
+    def _preflight_result(self, page, profile):
+        text = self._page_text(page)
+        status, reason = classify_brassring_page(text)
         if status == "closed":
             return AdapterResult(
                 status="closed",
@@ -236,47 +343,105 @@ class BrassRingAdapter(ATSAdapter):
                 message="BrassRing reports that this job was already applied to; skipped duplicate application.",
                 blockers=[],
             )
+
+        requirements = classify_brassring_requirements(text)
+        if requirements["us_citizenship_required"]:
+            citizen = _first_locked(
+                profile,
+                (
+                    "eligibility.us_citizen",
+                    "citizenship.us_citizen",
+                    "application_questions.us_citizen",
+                ),
+            )
+            if citizen is False:
+                return AdapterResult(
+                    status="ineligible",
+                    review_required=False,
+                    submitted=False,
+                    message="Job explicitly requires U.S. citizenship and the locked profile says the requirement is not met.",
+                    blockers=[{"category": "eligibility", "reason": "us_citizenship_required"}],
+                )
+            if citizen is not True:
+                return AdapterResult(
+                    status="eligibility_review",
+                    review_required=False,
+                    submitted=False,
+                    message="Job explicitly requires U.S. citizenship. Add a truthful locked eligibility.us_citizen value before the agent can continue.",
+                    blockers=[{"category": "eligibility", "reason": "us_citizenship_required_profile_missing"}],
+                )
+
+        if requirements["clearance_required"]:
+            clearance = _first_locked(
+                profile,
+                (
+                    "eligibility.has_required_security_clearance",
+                    "security_clearance.has_required_clearance",
+                ),
+            )
+            if clearance is False:
+                return AdapterResult(
+                    status="ineligible",
+                    review_required=False,
+                    submitted=False,
+                    message="Job explicitly requires a security clearance and the locked profile says the requirement is not met.",
+                    blockers=[{"category": "eligibility", "reason": "security_clearance_required"}],
+                )
+            if clearance is not True:
+                level = requirements.get("clearance_level") or "the required level"
+                return AdapterResult(
+                    status="eligibility_review",
+                    review_required=False,
+                    submitted=False,
+                    message=f"Job explicitly requires a security clearance ({level}). Add a truthful locked eligibility.has_required_security_clearance value before continuing.",
+                    blockers=[{"category": "eligibility", "reason": "security_clearance_profile_missing"}],
+                )
+
         return None
 
     def run(self, page, profile, context: ApplicationContext) -> AdapterResult:
         resume_current = bool(context.metadata.get("resume_current_page"))
+        active_page = page
+
         if not resume_current:
-            page.goto(context.job.url, wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(1600)
+            active_page.goto(context.job.url, wait_until="domcontentloaded", timeout=90000)
+            active_page.wait_for_timeout(1600)
 
-            preflight = self._preflight_result(page)
+            preflight = self._preflight_result(active_page, profile)
             if preflight is not None:
                 return preflight
 
-            opened = self._open_application(page)
+            active_page, opened = self._open_application(active_page)
             if opened:
-                page.wait_for_timeout(500)
+                active_page.wait_for_timeout(600)
 
-            preflight = self._preflight_result(page)
+            preflight = self._preflight_result(active_page, profile)
             if preflight is not None:
                 return preflight
 
-            if not opened and not self._application_surface_present(page):
+            if not opened and not self._application_surface_present(active_page):
                 return AdapterResult(
                     status="review",
                     review_required=True,
-                    message="BrassRing Apply/Quick Apply control was not found or did not open an application form.",
+                    message="BrassRing Apply control was not found or did not open an application form.",
                     blockers=[{"category": "apply_control", "reason": "application_surface_not_open"}],
+                    metadata={"page_url": active_page.url},
                 )
         else:
-            page.wait_for_timeout(350)
-            preflight = self._preflight_result(page)
+            active_page = self._resume_page(page)
+            active_page.wait_for_timeout(350)
+            preflight = self._preflight_result(active_page, profile)
             if preflight is not None:
                 return preflight
 
-        if detect_submission_confirmation(page):
+        if detect_submission_confirmation(active_page):
             return AdapterResult(
                 status="submitted",
                 submitted=True,
                 message="BrassRing submission confirmation detected.",
             )
 
-        account = handle_account_page(page, profile)
+        account = handle_account_page(active_page, profile)
         if account.verification_required:
             return AdapterResult(
                 status="verification_required",
@@ -286,7 +451,7 @@ class BrassRingAdapter(ATSAdapter):
                     "category": "verification",
                     "reason": "Complete CAPTCHA/MFA/email verification in the browser.",
                 }],
-                metadata={"account_state": account.state},
+                metadata={"account_state": account.state, "page_url": active_page.url},
             )
         if account.blockers:
             return AdapterResult(
@@ -294,7 +459,7 @@ class BrassRingAdapter(ATSAdapter):
                 review_required=True,
                 message=account.message,
                 blockers=account.blockers,
-                metadata={"account_state": account.state},
+                metadata={"account_state": account.state, "page_url": active_page.url},
             )
 
         first_name = profile.get("application_defaults.first_name")
@@ -307,43 +472,43 @@ class BrassRingAdapter(ATSAdapter):
 
         standard = {
             "first_name": self._fill_if_empty(
-                page,
+                active_page,
                 ['input[name*="first" i]', 'input[id*="first" i]', 'input[autocomplete="given-name"]'],
                 first_name,
             ),
             "last_name": self._fill_if_empty(
-                page,
+                active_page,
                 ['input[name*="last" i]', 'input[id*="last" i]', 'input[autocomplete="family-name"]'],
                 last_name,
             ),
             "full_name": self._fill_if_empty(
-                page,
+                active_page,
                 ['input[name="name"]', 'input[autocomplete="name"]'],
                 full_name,
             ),
             "email": self._fill_if_empty(
-                page,
+                active_page,
                 ['input[type="email"]', 'input[name*="email" i]', 'input[id*="email" i]'],
                 email,
             ),
             "phone": self._fill_if_empty(
-                page,
+                active_page,
                 ['input[type="tel"]', 'input[name*="phone" i]', 'input[id*="phone" i]'],
                 phone,
             ),
             "linkedin": self._fill_if_empty(
-                page,
+                active_page,
                 ['input[name*="linkedin" i]', 'input[id*="linkedin" i]'],
                 linkedin,
             ),
             "github": self._fill_if_empty(
-                page,
+                active_page,
                 ['input[name*="github" i]', 'input[id*="github" i]'],
                 github,
             ),
         }
 
-        resume_ok = self._upload_resume(page, context.resume_path)
+        resume_ok = self._upload_resume(active_page, context.resume_path)
         if not resume_ok:
             return AdapterResult(
                 status="review",
@@ -353,14 +518,14 @@ class BrassRingAdapter(ATSAdapter):
                 metadata={
                     "standard_fields": standard,
                     "account_state": account.state,
-                    "page_url": page.url,
+                    "page_url": active_page.url,
                 },
             )
 
         memory = ApplicationMemory()
         try:
             questions = fill_generic_form_questions(
-                page,
+                active_page,
                 profile,
                 company=context.company or context.job.company,
                 ats=self.name,
@@ -372,9 +537,9 @@ class BrassRingAdapter(ATSAdapter):
 
         blockers = list(questions.get("blockers") or [])
         decisions = questions.get("decisions") or []
-        submit = self._find_submit(page)
+        submit = self._find_submit(active_page)
 
-        if submit is None and not detect_submission_confirmation(page):
+        if submit is None and not detect_submission_confirmation(active_page):
             blockers.append({
                 "category": "submit_control",
                 "reason": "BrassRing submit/continue control was not identified on this page.",
@@ -390,7 +555,7 @@ class BrassRingAdapter(ATSAdapter):
                 message="BrassRing application requires review before submission.",
                 blockers=blockers,
                 decisions=decisions,
-                metadata={"standard_fields": standard, "resume_uploaded": True},
+                metadata={"standard_fields": standard, "resume_uploaded": True, "page_url": active_page.url},
             )
 
         if not submission.may_submit:
@@ -400,12 +565,12 @@ class BrassRingAdapter(ATSAdapter):
                 submitted=False,
                 message=submission.reason,
                 decisions=decisions,
-                metadata={"standard_fields": standard, "resume_uploaded": True},
+                metadata={"standard_fields": standard, "resume_uploaded": True, "page_url": active_page.url},
             )
 
         try:
             submit.click(timeout=5000)
-            page.wait_for_timeout(1500)
+            active_page.wait_for_timeout(1500)
         except Exception as exc:
             return AdapterResult(
                 status="review",
@@ -415,7 +580,7 @@ class BrassRingAdapter(ATSAdapter):
                 decisions=decisions,
             )
 
-        if detect_submission_confirmation(page):
+        if detect_submission_confirmation(active_page):
             return AdapterResult(
                 status="submitted",
                 submitted=True,

@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,16 +27,73 @@ class ApplicationMemoryTests(unittest.TestCase):
             db = str(Path(tmp) / "memory.db")
             memory = ApplicationMemory(db)
             try:
+                sensitive_questions = [
+                    "Will you now or in the future require sponsorship?",
+                    "Are you currently authorized to work in the Country to which you are applying to work?",
+                    "Do you have a conflict of interest?",
+                    "Do you have an outside business activity or financial interest?",
+                    "Are you or any member of your family an official of a State, Local, or Federal government?",
+                ]
+                for question in sensitive_questions:
+                    self.assertFalse(
+                        memory.remember_confirmed(question, "Yes", ats="avature")
+                    )
+                self.assertEqual(memory.stats()["stored"], 0)
+            finally:
+                memory.close()
+
+    def test_placeholder_answers_are_not_stored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "memory.db")
+            memory = ApplicationMemory(db)
+            try:
                 self.assertFalse(
                     memory.remember_confirmed(
-                        "Will you now or in the future require sponsorship?",
-                        "Yes",
-                        ats="workday",
+                        "Are you a commutable distance to the city listed on the role?",
+                        "Select an option",
+                        ats="avature",
                     )
                 )
                 self.assertEqual(memory.stats()["stored"], 0)
             finally:
                 memory.close()
+
+    def test_legacy_placeholder_rows_are_purged_on_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "memory.db")
+            memory = ApplicationMemory(db)
+            memory.close()
+
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO learned_answers (
+                        question_key, normalized_question, company, ats, answer,
+                        category, confirmations, first_seen_at, last_confirmed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "legacy-key",
+                        "are you a commutable distance",
+                        "",
+                        "avature",
+                        "Select an option",
+                        "user_confirmed",
+                        1,
+                        "2026-01-01T00:00:00+00:00",
+                        "2026-01-01T00:00:00+00:00",
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            reopened = ApplicationMemory(db)
+            try:
+                self.assertEqual(reopened.stats()["stored"], 0)
+            finally:
+                reopened.close()
 
     def test_conservative_fuzzy_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:

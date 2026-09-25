@@ -32,12 +32,53 @@ SENSITIVE_PATTERNS = [
     r"citizenship",
     r"sponsorship",
     r"work authorization",
+    r"authorized to work",
+    r"legally authorized",
     r"salary",
     r"compensation",
     r"public official",
+    r"government official",
+    r"official of (?:a )?(?:state|local|federal|government)",
+    r"family.*(?:employee|official)",
+    r"conflict of interest",
+    r"outside business activity",
+    r"financial interest",
     r"attest",
     r"certify",
+    r"acknowledge",
+    r"terms and conditions",
+    # Personal contact/address facts should come from candidate_profile.yaml,
+    # never from a prior employer form or LLM inference.
+    r"street",
+    r"address",
+    r"postal",
+    r"zip code",
+    r"zipcode",
+    r"state province",
+    r"state or province",
+    r"country phone code",
+    r"phone number",
+    r"mobile number",
+    r"telephone number",
+    r"city of residence",
+    r"country of residence",
 ]
+
+PLACEHOLDER_ANSWERS = {
+    "",
+    "select",
+    "select one",
+    "select option",
+    "select an option",
+    "please select",
+    "please select one",
+    "please select an option",
+    "choose",
+    "choose one",
+    "choose an option",
+    "--",
+    "-",
+}
 
 
 def _utc_now():
@@ -50,6 +91,14 @@ def normalize_question(question: str) -> str:
     value = value.replace("*", "")
     value = re.sub(r"[^a-z0-9+#. ]+", " ", value)
     return " ".join(value.split())
+
+
+def normalize_answer(answer: str) -> str:
+    return " ".join(str(answer or "").strip().lower().split())
+
+
+def is_placeholder_answer(answer: str) -> bool:
+    return normalize_answer(answer) in PLACEHOLDER_ANSWERS
 
 
 def question_key(question: str) -> str:
@@ -131,7 +180,25 @@ class ApplicationMemory:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._purge_unsafe_rows()
         self.conn.commit()
+
+    def _purge_unsafe_rows(self) -> None:
+        """Remove legacy rows that current safety rules would never store."""
+        rows = self.conn.execute(
+            "SELECT id, normalized_question, answer FROM learned_answers"
+        ).fetchall()
+        unsafe_ids = [
+            int(row["id"])
+            for row in rows
+            if is_sensitive_question(row["normalized_question"])
+            or is_placeholder_answer(row["answer"])
+        ]
+        if unsafe_ids:
+            self.conn.executemany(
+                "DELETE FROM learned_answers WHERE id=?",
+                [(item_id,) for item_id in unsafe_ids],
+            )
 
     def remember_confirmed(
         self,
@@ -143,7 +210,12 @@ class ApplicationMemory:
     ) -> bool:
         question = (question or "").strip()
         answer = (answer or "").strip()
-        if not question or not answer or is_sensitive_question(question):
+        if (
+            not question
+            or not answer
+            or is_placeholder_answer(answer)
+            or is_sensitive_question(question)
+        ):
             return False
 
         key = question_key(question)
@@ -228,7 +300,7 @@ class ApplicationMemory:
             (key, min_confirmations, company, ats, company, ats),
         ).fetchone()
 
-        if exact:
+        if exact and not is_placeholder_answer(exact["answer"]):
             return self._to_answer(question, exact, 1.0)
 
         rows = self.conn.execute(
@@ -245,6 +317,8 @@ class ApplicationMemory:
 
         scored = []
         for row in rows:
+            if is_placeholder_answer(row["answer"]):
+                continue
             similarity = question_similarity(question, row["normalized_question"])
             if similarity < fuzzy_threshold:
                 continue

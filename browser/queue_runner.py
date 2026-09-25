@@ -112,6 +112,60 @@ def _blocker_fingerprint(result) -> str:
     )
 
 
+def _live_pages(context):
+    """Return currently usable pages without raising if the browser is closing."""
+    try:
+        pages = list(context.pages)
+    except Exception:
+        return []
+
+    result = []
+    for candidate in pages:
+        try:
+            if not candidate.is_closed():
+                result.append(candidate)
+        except Exception:
+            continue
+    return result
+
+
+def _live_page(context, preferred=None, active_url: str = ""):
+    """
+    Resolve the page the user/adapter is actually working on.
+
+    ATS portals may replace the current tab during sign-in, password recovery,
+    SSO, or a manual Continue action. Queue-level review must follow that live
+    page instead of holding a stale Playwright Page object.
+    """
+    pages = _live_pages(context)
+    if not pages:
+        return None
+
+    wanted = str(active_url or "").strip()
+    if wanted:
+        for candidate in reversed(pages):
+            try:
+                if candidate.url == wanted:
+                    return candidate
+            except Exception:
+                continue
+
+    if preferred is not None:
+        try:
+            if not preferred.is_closed() and preferred in pages:
+                return preferred
+        except Exception:
+            pass
+
+    return pages[-1]
+
+
+def _page_for_result(context, preferred, result):
+    metadata = getattr(result, "metadata", None) or {}
+    active_url = metadata.get("active_page_url") or metadata.get("avature_page_url") or ""
+    return _live_page(context, preferred=preferred, active_url=active_url)
+
+
 def run_queue(
     profile_path: str,
     db_path: str,
@@ -222,6 +276,17 @@ def run_queue(
                 previous_manual_learned = None
 
                 for manual_cycle in range(max_manual_cycles + 1):
+                    page = _live_page(context, preferred=page)
+                    if page is None:
+                        final_status = "error"
+                        audit.event(
+                            run_id,
+                            "browser_target_missing",
+                            {"cycle": manual_cycle, "phase": "before_adapter"},
+                        )
+                        final_result = None
+                        break
+
                     try:
                         result = adapter.run(page, profile, application)
                     except Exception as exc:
@@ -238,6 +303,7 @@ def run_queue(
                     status = _result_status(result)
                     final_result = result
                     final_status = status
+                    page = _page_for_result(context, page, result) or page
 
                     audit.event(
                         run_id,
@@ -279,9 +345,38 @@ def run_queue(
                         )
                         break
 
+                    page = _page_for_result(context, page, result)
+                    if page is None:
+                        final_status = "error"
+                        final_result = None
+                        audit.event(
+                            run_id,
+                            "browser_target_missing",
+                            {"cycle": manual_cycle, "phase": "before_manual_review"},
+                        )
+                        break
+
                     before = trainer.capture(page)
                     _manual_prompt(status)
                     input("Press ENTER here after you are finished with this manual step...")
+
+                    # The user's action may have submitted a page, completed SSO,
+                    # or caused Workday/another ATS to replace the tab entirely.
+                    page = _live_page(context, preferred=page)
+                    if page is None:
+                        final_status = "error"
+                        final_result = None
+                        audit.event(
+                            run_id,
+                            "browser_target_missing",
+                            {"cycle": manual_cycle, "phase": "after_manual_review"},
+                        )
+                        print(
+                            "The ATS browser page was closed during manual review. "
+                            "The run was stopped cleanly instead of crashing."
+                        )
+                        break
+
                     after = trainer.capture(page)
 
                     learned = trainer.remember_changes(
@@ -338,8 +433,11 @@ def run_queue(
                         run_id,
                         status="error",
                         submitted=False,
-                        message="Adapter raised an exception.",
-                        blockers=[{"category": "exception", "reason": "See adapter_exception audit event."}],
+                        message="Adapter or browser target ended unexpectedly.",
+                        blockers=[{
+                            "category": "exception",
+                            "reason": "See adapter_exception/browser_target_missing audit event.",
+                        }],
                     )
                     payload = {
                         "job_id": job_id,
@@ -347,7 +445,7 @@ def run_queue(
                         "ats": adapter.name,
                         "status": "error",
                         "submitted": False,
-                        "message": "Adapter raised an exception.",
+                        "message": "Adapter or browser target ended unexpectedly.",
                     }
                 else:
                     store.set_application_status(job_id, final_status)
@@ -371,7 +469,10 @@ def run_queue(
                 results.append(payload)
                 print(json.dumps(payload, indent=2))
 
-            context.close()
+            try:
+                context.close()
+            except Exception:
+                pass
     finally:
         memory.close()
         audit.close()

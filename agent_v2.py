@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import os
+import re
+import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
+
+import yaml
 
 from agent.profile import CandidateProfile
 from browser.queue_runner import run_queue
@@ -13,6 +20,36 @@ from pipeline.job_sources import (
 )
 from pipeline.job_store import JobStore
 from pipeline.orchestrator import PipelineOrchestrator
+
+
+_MARKDOWN_LINK_RE = re.compile(
+    r"^\s*\[(https?://[^\]]+)\]\((https?://[^)]+)\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_cli_url(value: str) -> str:
+    """Normalize a copied URL before it reaches discovery/browser navigation.
+
+    Chat/README copy-paste can turn a raw URL into Markdown such as
+    ``[https://host/job](https://host/job)``. Browsers and urlparse do not treat
+    that whole string as a URL, so unwrap the actual Markdown target first.
+    """
+    text = str(value or "").strip()
+    match = _MARKDOWN_LINK_RE.match(text)
+    if match:
+        text = match.group(2).strip()
+
+    if text.startswith("<") and text.endswith(">"):
+        text = text[1:-1].strip()
+
+    parsed = urlparse(text)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            "Expected a raw http(s) job/career URL; received an invalid URL value."
+        )
+
+    return text
 
 
 def _workday_terms(profile):
@@ -80,7 +117,17 @@ def _discover(args, profile):
         except Exception as exc:
             warnings.append({"source": "lever", "url": site, "error": str(exc)})
 
-    urls = list(args.workday or []) + list(args.source_url or [])
+    urls = []
+    for raw_url in list(args.workday or []) + list(args.source_url or []):
+        try:
+            urls.append(_normalize_cli_url(raw_url))
+        except ValueError as exc:
+            warnings.append({
+                "source": "cli_url",
+                "url": str(raw_url or ""),
+                "error": str(exc),
+            })
+
     if urls:
         found, errors = expand_career_urls(
             urls,
@@ -99,8 +146,26 @@ def _prepare(profile, jobs, args):
     store = JobStore(args.db)
     try:
         orchestrator = PipelineOrchestrator(profile, store)
+        ingested_ids = []
         if jobs:
-            orchestrator.ingest(jobs)
+            ingested_ids = orchestrator.ingest(jobs)
+
+        # Rediscovery is also our crash-recovery boundary. An older code version
+        # may have left a job in adapter_missing, while an interrupted browser
+        # run can leave application_status=in_progress forever. Both states must
+        # be made resumable without asking the user to edit SQLite by hand.
+        for job_id in ingested_ids:
+            row = store.get(str(job_id))
+            if row is None:
+                continue
+            status = str(row["application_status"] or "").strip().lower()
+            if status == "adapter_missing":
+                store.set_application_status(str(job_id), "not_started")
+            elif status == "in_progress":
+                # Preserve the fact that this may be a partially completed
+                # application. The browser profile/session can resume it, and
+                # review is already part of the default resumable queue.
+                store.set_application_status(str(job_id), "review")
 
         ranked = orchestrator.rank_all(limit=args.scan_limit)
         prepared = orchestrator.prepare_resumes(
@@ -113,6 +178,43 @@ def _prepare(profile, jobs, args):
 
     strong = [item for item in ranked if item.score >= args.minimum_score]
     return ranked, strong, prepared
+
+
+def _runtime_profile(original_path: Path, unattended: bool = False, job_source: str = ""):
+    """
+    Build an ephemeral profile for one run when command-line execution policy
+    differs from the persistent candidate profile.
+
+    The temporary file is deleted after the run. This lets unattended mode force
+    auto_if_safe submission without rewriting the user's real YAML and lets a
+    one-off truthful source (LinkedIn, Indeed, etc.) be supplied per application.
+    """
+    profile = CandidateProfile(str(original_path))
+    data = copy.deepcopy(profile.data)
+    changed = False
+
+    if unattended:
+        submission = data.setdefault("submission", {})
+        submission["mode"] = "auto_if_safe"
+        changed = True
+
+    source = str(job_source or "").strip()
+    if source:
+        defaults = data.setdefault("application_defaults", {})
+        defaults["job_source"] = source
+        changed = True
+
+    if not changed:
+        return original_path, profile, None
+
+    fd, temp_name = tempfile.mkstemp(prefix="job_agent_runtime_", suffix=".yaml")
+    os.close(fd)
+    temp_path = Path(temp_name)
+    temp_path.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return temp_path, CandidateProfile(str(temp_path)), temp_path
 
 
 def build_parser():
@@ -167,6 +269,14 @@ def build_parser():
     parser.add_argument("--company", default="")
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument(
+        "--job-source",
+        default="",
+        help=(
+            "Truthful source for this run, e.g. 'LinkedIn Job Post' or 'Indeed'. "
+            "Overrides application_defaults.job_source only in an ephemeral runtime profile."
+        ),
+    )
+    parser.add_argument(
         "--workday-max-jobs",
         type=int,
         default=75,
@@ -188,48 +298,78 @@ def build_parser():
         action="store_true",
         help="Record review-required jobs and move on instead of pausing for user input.",
     )
+    parser.add_argument(
+        "--unattended",
+        action="store_true",
+        help=(
+            "Run without interactive ENTER prompts. Forces submission.mode=auto_if_safe "
+            "for this run, auto-submits only when all safe-submit checks pass, and records/"
+            "skips applications that still require CAPTCHA, MFA, legal consent, or another "
+            "unresolved review-required answer."
+        ),
+    )
     return parser
 
 
 def main():
     args = build_parser().parse_args()
-    profile_path = Path(args.profile)
-    if not profile_path.exists():
+    original_profile_path = Path(args.profile)
+    if not original_profile_path.exists():
         raise SystemExit(
-            f"Profile not found: {profile_path}. Copy candidate_profile.example.yaml "
+            f"Profile not found: {original_profile_path}. Copy candidate_profile.example.yaml "
             "to candidate_profile.yaml and fill only truthful values."
         )
 
-    profile = CandidateProfile(str(profile_path))
-    jobs, warnings = _discover(args, profile)
-    ranked, strong, prepared = _prepare(profile, jobs, args)
+    runtime_temp = None
+    try:
+        profile_path, profile, runtime_temp = _runtime_profile(
+            original_profile_path,
+            unattended=bool(args.unattended),
+            job_source=args.job_source,
+        )
 
-    prepared_ok = sum(1 for item in prepared if item.get("resume_path"))
-    print("\nV2 PIPELINE")
-    print(f"Discovered this run: {len(jobs)}")
-    print(f"Ranked in DB:        {len(ranked)}")
-    print(f"Qualified:           {len(strong)}")
-    print(f"Resumes prepared:    {prepared_ok}")
+        jobs, warnings = _discover(args, profile)
+        ranked, strong, prepared = _prepare(profile, jobs, args)
 
-    if warnings:
-        print(f"Warnings:            {len(warnings)}")
-        for item in warnings[:25]:
-            print(f" - {item.get('source')}: {item.get('url')} -> {item.get('error')}")
+        prepared_ok = sum(1 for item in prepared if item.get("resume_path"))
+        print("\nV2 PIPELINE")
+        print(f"Discovered this run: {len(jobs)}")
+        print(f"Ranked in DB:        {len(ranked)}")
+        print(f"Qualified:           {len(strong)}")
+        print(f"Resumes prepared:    {prepared_ok}")
+        print(f"Run mode:            {'unattended' if args.unattended else 'interactive'}")
 
-    if args.prepare_only:
-        print("\nPrepare-only mode complete.")
-        return
+        if args.unattended:
+            print(
+                "Unattended policy: safe deterministic/profile-backed answers may be submitted; "
+                "unresolved CAPTCHA/MFA/legal/review blockers are recorded and skipped without pausing."
+            )
 
-    run_queue(
-        profile_path=str(profile_path),
-        db_path=args.db,
-        audit_db=args.audit_db,
-        browser_profile=args.browser_profile,
-        minimum_score=args.minimum_score,
-        limit=args.apply_limit,
-        stop_on_review=not args.continue_on_review,
-        max_manual_cycles=max(0, int(args.max_manual_cycles)),
-    )
+        if warnings:
+            print(f"Warnings:            {len(warnings)}")
+            for item in warnings[:25]:
+                print(f" - {item.get('source')}: {item.get('url')} -> {item.get('error')}")
+
+        if args.prepare_only:
+            print("\nPrepare-only mode complete.")
+            return
+
+        run_queue(
+            profile_path=str(profile_path),
+            db_path=args.db,
+            audit_db=args.audit_db,
+            browser_profile=args.browser_profile,
+            minimum_score=args.minimum_score,
+            limit=args.apply_limit,
+            stop_on_review=not (args.continue_on_review or args.unattended),
+            max_manual_cycles=max(0, int(args.max_manual_cycles)),
+        )
+    finally:
+        if runtime_temp is not None:
+            try:
+                runtime_temp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

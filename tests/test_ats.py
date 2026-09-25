@@ -1,6 +1,7 @@
 import unittest
 
 from pipeline.ats import (
+    ATS_AVATURE,
     ATS_BRASSRING,
     ATS_CAREER_SITE,
     ATS_GREENHOUSE,
@@ -37,6 +38,21 @@ class AtsDetectionTests(unittest.TestCase):
                 "PageType=JobDetails&partnerid=25539&siteid=5313&jobId=5235658"
             ),
             ATS_BRASSRING,
+        )
+
+    def test_metlife_is_avature(self):
+        self.assertEqual(
+            detect_ats(
+                "https://www.metlifecareers.com/en_US/ml/ApplicationConfirmation?"
+                "jobId=18437&source=LinkedIn"
+            ),
+            ATS_AVATURE,
+        )
+
+    def test_avature_host(self):
+        self.assertEqual(
+            detect_ats("https://example.avature.net/careers/JobDetail/123"),
+            ATS_AVATURE,
         )
 
     def test_linkedin(self):
