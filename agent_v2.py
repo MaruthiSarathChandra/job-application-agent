@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+import re
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 
@@ -18,6 +20,36 @@ from pipeline.job_sources import (
 )
 from pipeline.job_store import JobStore
 from pipeline.orchestrator import PipelineOrchestrator
+
+
+_MARKDOWN_LINK_RE = re.compile(
+    r"^\s*\[(https?://[^\]]+)\]\((https?://[^)]+)\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_cli_url(value: str) -> str:
+    """Normalize a copied URL before it reaches discovery/browser navigation.
+
+    Chat/README copy-paste can turn a raw URL into Markdown such as
+    ``[https://host/job](https://host/job)``. Browsers and urlparse do not treat
+    that whole string as a URL, so unwrap the actual Markdown target first.
+    """
+    text = str(value or "").strip()
+    match = _MARKDOWN_LINK_RE.match(text)
+    if match:
+        text = match.group(2).strip()
+
+    if text.startswith("<") and text.endswith(">"):
+        text = text[1:-1].strip()
+
+    parsed = urlparse(text)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            "Expected a raw http(s) job/career URL; received an invalid URL value."
+        )
+
+    return text
 
 
 def _workday_terms(profile):
@@ -85,7 +117,17 @@ def _discover(args, profile):
         except Exception as exc:
             warnings.append({"source": "lever", "url": site, "error": str(exc)})
 
-    urls = list(args.workday or []) + list(args.source_url or [])
+    urls = []
+    for raw_url in list(args.workday or []) + list(args.source_url or []):
+        try:
+            urls.append(_normalize_cli_url(raw_url))
+        except ValueError as exc:
+            warnings.append({
+                "source": "cli_url",
+                "url": str(raw_url or ""),
+                "error": str(exc),
+            })
+
     if urls:
         found, errors = expand_career_urls(
             urls,
